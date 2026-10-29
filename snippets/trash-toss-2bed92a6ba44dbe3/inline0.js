@@ -1,0 +1,1 @@
+export function notify_completed(seconds) { window.parent.postMessage({ completed: true, points: 2000, activityKey: 'trash-toss', seconds: Math.round(seconds) }, '*'); }

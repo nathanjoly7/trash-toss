@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Trash Toss</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #2b2f36; }
+    canvas#bevy { display: block; width: 100%; height: 100%; touch-action: none; outline: none; }
+    #loading {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      color: #fff; font: 600 18px system-ui, sans-serif; text-align: center; padding: 16px;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="bevy"></canvas>
+  <div id="loading">Chargement du bureau…</div>
+  <script type="module">
+    import init from './trash-toss.js';
+
+    const loading = document.getElementById('loading');
+
+    async function download(url) {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(url + ' : HTTP ' + response.status);
+      const total = Number(response.headers.get('Content-Length')) || 0;
+      const reader = response.body.getReader();
+      const chunks = [];
+      let received = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        loading.textContent = total
+          ? 'Chargement du bureau… ' + Math.round((received / total) * 100) + ' %'
+          : 'Chargement du bureau… ' + (received / 1048576).toFixed(1) + ' Mo';
+      }
+      return new Blob(chunks);
+    }
+
+    // Le .wasm compressé fait 12 Mo au lieu de 60 : on le décompresse nous-mêmes, quel que soit
+    // l'hébergeur. Si le serveur l'a déjà décompressé (en-tête Content-Encoding), on le prend tel quel.
+    async function loadWasm() {
+      if ('DecompressionStream' in window) {
+        try {
+          const blob = await download('./trash-toss_bg.wasm.gz');
+          const head = new Uint8Array(await blob.slice(0, 2).arrayBuffer());
+          const body = head[0] === 0x1f && head[1] === 0x8b
+            ? blob.stream().pipeThrough(new DecompressionStream('gzip'))
+            : blob;
+          loading.textContent = 'Démarrage…';
+          return new Response(body, { headers: { 'Content-Type': 'application/wasm' } });
+        } catch (error) {
+          console.warn('Version compressée indisponible, repli sur le .wasm brut', error);
+        }
+      }
+      return new Response(await download('./trash-toss_bg.wasm'), {
+        headers: { 'Content-Type': 'application/wasm' },
+      });
+    }
+
+    // Sur le web, winit lève une exception volontaire pour garder la main : ce n'est pas une erreur.
+    init({ module_or_path: loadWasm() }).then(
+      () => loading.remove(),
+      (error) => {
+        if (String(error).includes('Using exceptions for control flow')) {
+          loading.remove();
+        } else {
+          loading.textContent = 'Le jeu n’a pas pu démarrer : ' + error;
+          throw error;
+        }
+      },
+    );
+  </script>
+</body>
+</html>
