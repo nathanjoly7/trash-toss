@@ -109,10 +109,29 @@ mod web {
     // Le bouton « Passer » du cadre envoie le même message avec 0 point.
     #[wasm_bindgen(inline_js = "export function notify_completed(seconds) { \
         window.parent.postMessage({ completed: true, points: 2000, activityKey: 'trash-toss', \
-        seconds: Math.round(seconds) }, '*'); }")]
+        seconds: Math.round(seconds) }, '*'); } \
+        export function canvas_css_width() { return document.getElementById('bevy')?.clientWidth ?? 0; } \
+        export function canvas_css_height() { return document.getElementById('bevy')?.clientHeight ?? 0; }")]
     extern "C" {
         pub fn notify_completed(seconds: f32);
+        pub fn canvas_css_width() -> f64;
+        pub fn canvas_css_height() -> f64;
     }
+}
+
+/// Passe d'une position du doigt (pixels CSS) aux pixels logiques de Bevy. Les deux sont égaux
+/// d'habitude, mais quand le navigateur mesure mal le canvas (vu en émulation mobile, densité 2),
+/// le doigt viserait à côté.
+fn pointer_scale(window: &Window) -> Vec2 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let css = Vec2::new(web::canvas_css_width() as f32, web::canvas_css_height() as f32);
+        if css.min_element() > 0.0 {
+            return window.size() / css;
+        }
+    }
+    let _ = window;
+    Vec2::ONE
 }
 
 #[derive(Clone, Copy)]
@@ -800,7 +819,9 @@ fn handle_pointer(
                 game.restart_requested = true;
             } else if hand.held.is_some() {
                 throw_held(&mut hand, &mut bodies, transform, now);
-            } else if let Some(entity) = near(gesture.last, TOUCH_TOLERANCE) {
+            } else if let scale = pointer_scale(&window)
+                && let Some(entity) = near(gesture.last * scale, TOUCH_TOLERANCE * scale.x)
+            {
                 grab(&mut hand, &mut bodies, entity, true);
             }
         }
