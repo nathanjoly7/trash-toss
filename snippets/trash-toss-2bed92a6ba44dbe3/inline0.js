@@ -1,1 +1,1 @@
-export function notify_completed(seconds) { window.parent.postMessage({ completed: true, points: 2000, activityKey: 'trash-toss', seconds: Math.round(seconds) }, '*'); }
+export function notify_completed(seconds) { window.parent.postMessage({ completed: true, points: 2000, activityKey: 'trash-toss', seconds: Math.round(seconds) }, '*'); } export function canvas_css_width() { return document.getElementById('bevy')?.clientWidth ?? 0; } export function canvas_css_height() { return document.getElementById('bevy')?.clientHeight ?? 0; }
