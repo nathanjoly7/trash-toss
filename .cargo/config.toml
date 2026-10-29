@@ -1,0 +1,11 @@
+﻿# Repris de bevy/.cargo/config_fast_builds.toml (Bevy 0.20).
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+rustdocflags = ["-Clinker=rust-lld.exe"]
+
+# Dossier de compilation partagé avec bevy-sandbox : Bevy n'est compilé qu'une fois.
+[build]
+target-dir = "../bevy-sandbox/target"
+
+[alias]
+dev = "run --features dev"

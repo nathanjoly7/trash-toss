@@ -1,0 +1,32 @@
+﻿[package]
+name = "trash-toss"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+avian3d = "0.8.0"
+bevy = "0.20.1"
+
+# Même version que wasm-bindgen-cli : sert à prévenir GeoGaming que l'étape est réussie.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.129"
+
+[features]
+# Bevy en DLL : recompilations bien plus rapides. Lancé par `cargo dev`, jamais en release.
+dev = ["bevy/dynamic_linking"]
+# Test automatique : ramasse et lance chaque déchet tout seul (`cargo dev --features autoplay`).
+autoplay = []
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Export web : `cargo build --profile web --target wasm32-unknown-unknown`, voir build-web.ps1.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+# « debuginfo » laisse la section des noms de fonctions : 84 Mo sur 147.
+strip = true
