@@ -1,5 +1,6 @@
 #[cfg(feature = "autoplay")]
 mod autoplay;
+mod clean_desk;
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
@@ -35,8 +36,9 @@ const BIN_INNER: f32 = 0.32;
 const BIN_OUTER: f32 = 0.35;
 const BIN_HEIGHT: f32 = 0.65;
 
-/// Le déchet visé vole jusqu'à la main : au téléphone, on ne se déplace pas.
-const REACH: f32 = 8.0;
+/// Au doigt, le tiers gauche de l'écran est un joystick : on y pose le pouce pour marcher.
+const JOYSTICK_ZONE: f32 = 0.35;
+const JOYSTICK_RADIUS: f32 = 60.0;
 const CARRY_MAX_SPEED: f32 = 12.0;
 const MIN_THROW_SPEED: f32 = 3.0;
 const MAX_THROW_SPEED: f32 = 12.0;
@@ -50,6 +52,86 @@ struct Player {
     yaw: f32,
     pitch: f32,
 }
+
+/// « Trash Toss » par défaut ; « Bureau propre » avec `cargo dev -- bureau-propre`
+/// ou `?jeu=bureau-propre` dans l'adresse de la page web.
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
+enum GameMode {
+    Trash,
+    CleanDesk,
+}
+
+impl GameMode {
+    fn detect() -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let wanted = web::game_param();
+        #[cfg(not(target_arch = "wasm32"))]
+        let wanted = std::env::args().nth(1).unwrap_or_default();
+        if wanted == "bureau-propre" { Self::CleanDesk } else { Self::Trash }
+    }
+
+    fn activity_key(self) -> &'static str {
+        match self {
+            Self::Trash => "trash-toss",
+            Self::CleanDesk => "bureau-propre",
+        }
+    }
+
+    /// Trash Toss : le déchet visé vole jusqu'à la main. Bureau propre : on va jusqu'à l'objet.
+    fn reach(self) -> f32 {
+        match self {
+            Self::Trash => 8.0,
+            Self::CleanDesk => 2.5,
+        }
+    }
+}
+
+/// Meuble qu'on ne traverse pas : le joueur n'a pas de corps physique, on le repousse.
+#[derive(Component)]
+struct Obstacle {
+    radius: f32,
+}
+
+/// Pouce posé à gauche de l'écran : sa position par rapport au point de départ donne la marche.
+#[derive(Resource, Default)]
+struct Joystick {
+    touch: Option<u64>,
+    origin: Vec2,
+    current: Vec2,
+}
+
+impl Joystick {
+    fn input(&self) -> Vec2 {
+        if self.touch.is_none() {
+            return Vec2::ZERO;
+        }
+        ((self.current - self.origin) / JOYSTICK_RADIUS).clamp_length_max(1.0)
+    }
+}
+
+#[derive(Component)]
+struct JoystickBase;
+
+#[derive(Component)]
+struct JoystickKnob;
+
+/// Tout ce qu'une manche fait apparaître : supprimé puis recréé quand on rejoue.
+#[derive(Component)]
+struct RoundEntity;
+
+/// Objet qu'on peut attraper et lancer.
+#[derive(Component)]
+struct Grabbable;
+
+/// Cible qu'on touche sans l'attraper (écran, tableau). Le rayon agrandit la zone sensible.
+#[derive(Component)]
+struct Touchable {
+    radius: f32,
+}
+
+/// Cibles touchées cette image, traitées par le mode de jeu.
+#[derive(Resource, Default)]
+struct Taps(Vec<Entity>);
 
 #[derive(Component)]
 struct Trash;
@@ -85,17 +167,25 @@ struct Hand {
 #[derive(Resource, Default)]
 struct Game {
     total: usize,
-    in_bin: usize,
+    done: usize,
+    errors: u32,
+    points: u32,
     started_at: f32,
     finished_at: Option<f32>,
+    message: String,
+    message_error: bool,
     message_until: f32,
     notified: bool,
     restart_requested: bool,
+    /// Bureau propre sur le web : le joueur lit le débrief, puis touche pour valider l'étape.
+    continue_requested: bool,
 }
 
-/// Geste en cours (doigt, ou souris non capturée sur le web).
+/// Geste en cours (doigt, ou souris non capturée sur le web) : regarder, prendre, lancer.
 #[derive(Resource, Default)]
 struct Gesture {
+    /// Doigt qui fait le geste ; `None` pour la souris.
+    touch: Option<u64>,
     start: Option<Vec2>,
     last: Vec2,
     dragging: bool,
@@ -107,15 +197,17 @@ mod web {
 
     // Contrat des activités Widget GeoGaming : le pont de l'app relaie ce message et valide l'étape.
     // Le bouton « Passer » du cadre envoie le même message avec 0 point.
-    #[wasm_bindgen(inline_js = "export function notify_completed(seconds) { \
-        window.parent.postMessage({ completed: true, points: 2000, activityKey: 'trash-toss', \
+    #[wasm_bindgen(inline_js = "export function notify_completed(key, seconds, points) { \
+        window.parent.postMessage({ completed: true, points: points, activityKey: key, \
         seconds: Math.round(seconds) }, '*'); } \
         export function canvas_css_width() { return document.getElementById('bevy')?.clientWidth ?? 0; } \
-        export function canvas_css_height() { return document.getElementById('bevy')?.clientHeight ?? 0; }")]
+        export function canvas_css_height() { return document.getElementById('bevy')?.clientHeight ?? 0; } \
+        export function game_param() { return new URLSearchParams(location.search).get('jeu') ?? ''; }")]
     extern "C" {
-        pub fn notify_completed(seconds: f32);
+        pub fn notify_completed(key: &str, seconds: f32, points: u32);
         pub fn canvas_css_width() -> f64;
         pub fn canvas_css_height() -> f64;
+        pub fn game_param() -> String;
     }
 }
 
@@ -143,11 +235,19 @@ enum Kind {
 }
 
 fn main() {
+    let mode = GameMode::detect();
+    let trash = |mode: Res<GameMode>| *mode == GameMode::Trash;
+    let clean_desk = |mode: Res<GameMode>| *mode == GameMode::CleanDesk;
+
     let mut app = App::new();
     app.add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "Trash Toss".into(),
+                    title: match mode {
+                        GameMode::Trash => "Trash Toss",
+                        GameMode::CleanDesk => "Bureau propre",
+                    }
+                    .into(),
                     canvas: Some("#bevy".into()),
                     fit_canvas_to_parent: true,
                     ..default()
@@ -156,6 +256,7 @@ fn main() {
             }),
             PhysicsPlugins::default().set(PhysicsInterpolationPlugin::interpolate_all()),
         ))
+        .insert_resource(mode)
         .insert_resource(GlobalAmbientLight {
             brightness: 300.0,
             ..default()
@@ -163,16 +264,18 @@ fn main() {
         .init_resource::<Hand>()
         .init_resource::<Game>()
         .init_resource::<Gesture>()
+        .init_resource::<Joystick>()
+        .init_resource::<Taps>()
         .add_systems(
             Startup,
             (
                 use_embedded_font,
                 setup_office,
-                setup_bin,
                 setup_player,
                 setup_ui,
-                setup_trash,
                 lock_cursor,
+                (setup_bin, setup_trash).run_if(trash),
+                clean_desk::setup.after(setup_ui).run_if(clean_desk),
             ),
         )
         .add_systems(
@@ -182,16 +285,19 @@ fn main() {
                 look_and_walk,
                 handle_pointer,
                 carry_held,
-                detect_in_bin,
+                detect_in_bin.run_if(trash),
+                (clean_desk::sort_items, clean_desk::apply_taps).run_if(clean_desk),
                 notify_geogaming,
-                update_ui,
+                update_joystick_ui,
+                update_ui.run_if(trash),
+                (clean_desk::update_ui, clean_desk::place_labels).run_if(clean_desk),
                 toggle_cursor,
                 restart,
             )
                 .chain(),
         );
     #[cfg(feature = "autoplay")]
-    app.add_systems(Update, autoplay::autoplay);
+    app.add_systems(Update, (autoplay::autoplay, autoplay::autoplay_clean_desk));
     app.run();
 }
 
@@ -217,6 +323,7 @@ fn setup_office(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mode: Res<GameMode>,
 ) {
     let carpet = materials.add(StandardMaterial {
         base_color: Color::srgb(0.30, 0.34, 0.40),
@@ -270,15 +377,17 @@ fn setup_office(
         }
     }
 
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(2.0 * hx, 0.004, 0.06))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.8, 0.1),
-            emissive: LinearRgba::rgb(0.3, 0.24, 0.03),
-            ..default()
-        })),
-        Transform::from_xyz(0.0, 0.002, THROW_LINE_Z),
-    ));
+    if *mode == GameMode::Trash {
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(2.0 * hx, 0.004, 0.06))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.8, 0.1),
+                emissive: LinearRgba::rgb(0.3, 0.24, 0.03),
+                ..default()
+            })),
+            Transform::from_xyz(0.0, 0.002, THROW_LINE_Z),
+        ));
+    }
 
     // Tableau blanc au fond.
     commands.spawn((
@@ -306,10 +415,23 @@ fn setup_office(
         ));
     }
 
-    // Bureaux contre les murs, écrans tournés vers le centre.
+    // Bureaux contre les murs, écrans tournés vers le centre. Bureau propre : à 18 h, ils sont en
+    // veille, sauf la session restée ouverte que le mode ajoute par-dessus.
+    let screen = materials.add(match *mode {
+        GameMode::Trash => StandardMaterial {
+            base_color: Color::BLACK,
+            emissive: LinearRgba::rgb(0.5, 1.0, 2.0),
+            ..default()
+        },
+        GameMode::CleanDesk => StandardMaterial {
+            base_color: Color::srgb(0.02, 0.02, 0.03),
+            perceptual_roughness: 0.15,
+            ..default()
+        },
+    });
     for z in [-5.0, -2.0, 2.0] {
-        spawn_desk(&mut commands, &mut meshes, &mut materials, Vec3::new(-hx + 0.5, 0.0, z), FRAC_PI_2);
-        spawn_desk(&mut commands, &mut meshes, &mut materials, Vec3::new(hx - 0.5, 0.0, z), -FRAC_PI_2);
+        spawn_desk(&mut commands, &mut meshes, &mut materials, &screen, Vec3::new(-hx + 0.5, 0.0, z), FRAC_PI_2);
+        spawn_desk(&mut commands, &mut meshes, &mut materials, &screen, Vec3::new(hx - 0.5, 0.0, z), -FRAC_PI_2);
     }
 
     // Plantes dans les coins du fond.
@@ -339,6 +461,7 @@ fn spawn_desk(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    screen: &Handle<StandardMaterial>,
     position: Vec3,
     angle: f32,
 ) {
@@ -353,11 +476,6 @@ fn spawn_desk(
         perceptual_roughness: 0.4,
         ..default()
     });
-    let screen = materials.add(StandardMaterial {
-        base_color: Color::BLACK,
-        emissive: LinearRgba::rgb(0.5, 1.0, 2.0),
-        ..default()
-    });
     let fabric = materials.add(Color::srgb(0.15, 0.2, 0.32));
 
     // Repère local : plateau le long de x, écran au fond (z négatif) tourné vers +z.
@@ -367,7 +485,7 @@ fn spawn_desk(
         (Vec3::new(0.04, 0.72, 0.75), Vec3::new(0.76, 0.36, 0.0), metal.clone()),
         (Vec3::new(0.06, 0.25, 0.06), Vec3::new(0.0, 0.885, -0.25), metal.clone()),
         (Vec3::new(0.62, 0.38, 0.03), Vec3::new(0.0, 1.13, -0.25), metal.clone()),
-        (Vec3::new(0.58, 0.34, 0.005), Vec3::new(0.0, 1.13, -0.233), screen),
+        (Vec3::new(0.58, 0.34, 0.005), Vec3::new(0.0, 1.13, -0.233), screen.clone()),
         (Vec3::new(0.48, 0.06, 0.46), Vec3::new(0.0, 0.46, 0.6), fabric.clone()),
         (Vec3::new(0.48, 0.5, 0.06), Vec3::new(0.0, 0.76, 0.84), fabric),
         (Vec3::new(0.05, 0.43, 0.05), Vec3::new(0.0, 0.215, 0.6), metal),
@@ -529,6 +647,8 @@ fn spawn_trash(
         let k = i as f32;
         commands.spawn((
             Trash,
+            Grabbable,
+            RoundEntity,
             Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(materials.add(material)),
             Transform::from_translation(position)
@@ -553,11 +673,12 @@ fn spawn_trash(
 
 // ---------- Joueur ----------
 
-fn setup_player(mut commands: Commands) {
+fn setup_player(mut commands: Commands, mode: Res<GameMode>) {
     commands.spawn((
         Player {
             yaw: 0.0,
-            pitch: -0.3,
+            // Trash Toss : les déchets au sol ; Bureau propre : les bacs et la pièce.
+            pitch: if *mode == GameMode::Trash { -0.3 } else { -0.15 },
         },
         Camera3d::default(),
         Projection::from(PerspectiveProjection {
@@ -622,6 +743,9 @@ fn look_and_walk(
     keys: Res<ButtonInput<KeyCode>>,
     mouse_motion: Res<AccumulatedMouseMotion>,
     cursor: Single<&CursorOptions>,
+    mode: Res<GameMode>,
+    joystick: Res<Joystick>,
+    obstacles: Query<(&Transform, &Obstacle), Without<Player>>,
     player: Single<(&mut Player, &mut Transform)>,
 ) {
     let (mut player, mut transform) = player.into_inner();
@@ -646,36 +770,83 @@ fn look_and_walk(
     if keys.any_pressed([KeyCode::KeyA, KeyCode::ArrowLeft]) {
         direction -= right;
     }
-    transform.translation += direction.normalize_or_zero() * WALK_SPEED * time.delta_secs();
+    // Joystick : pousser le pouce vers le haut de l'écran fait avancer.
+    let stick = joystick.input();
+    direction = direction.normalize_or_zero() + forward * -stick.y + right * stick.x;
+    transform.translation += direction.clamp_length_max(1.0) * WALK_SPEED * time.delta_secs();
 
-    // Pas de corps physique pour le joueur : on le garde derrière la ligne, entre les bureaux.
+    // Pas de corps physique pour le joueur : on le garde entre les bureaux, et derrière la ligne
+    // jaune dans Trash Toss.
+    let front = match *mode {
+        GameMode::Trash => THROW_LINE_Z + 0.05,
+        GameMode::CleanDesk => -ROOM_HALF_Z + 0.4,
+    };
     let p = &mut transform.translation;
     p.x = p.x.clamp(-ROOM_HALF_X + 1.1, ROOM_HALF_X - 1.1);
-    p.z = p.z.clamp(THROW_LINE_Z + 0.05, ROOM_HALF_Z - 0.4);
+    p.z = p.z.clamp(front, ROOM_HALF_Z - 0.4);
+    for (obstacle, Obstacle { radius }) in &obstacles {
+        let offset = Vec2::new(p.x - obstacle.translation.x, p.z - obstacle.translation.z);
+        if offset.length() < *radius {
+            let pushed = offset.normalize_or(Vec2::Y) * *radius;
+            p.x = obstacle.translation.x + pushed.x;
+            p.z = obstacle.translation.z + pushed.y;
+        }
+    }
 }
 
-/// Ce que fait le pointeur d'un geste cette image : premier doigt, sinon souris non capturée.
+/// Ce que fait le pointeur du geste cette image.
+#[derive(Default)]
 struct PointerFrame {
-    pressed: Option<Vec2>,
+    /// Doigt (ou `None` pour la souris) et position de l'appui.
+    pressed: Option<(Option<u64>, Vec2)>,
     held: Option<Vec2>,
     released: bool,
 }
 
-fn read_pointer(touches: &Touches, mouse: &ButtonInput<MouseButton>, window: &Window) -> PointerFrame {
-    let touch_active = touches.iter().next().is_some()
-        || touches.iter_just_released().next().is_some()
-        || touches.iter_just_canceled().next().is_some();
-    if touch_active {
+/// Répartit les doigts : le premier posé dans le tiers gauche pilote le joystick, un autre fait
+/// le geste. Sans doigt sur l'écran, la souris non capturée fait le geste.
+fn read_pointer(
+    touches: &Touches,
+    mouse: &ButtonInput<MouseButton>,
+    window: &Window,
+    gesture: &Gesture,
+    joystick: &mut Joystick,
+) -> PointerFrame {
+    let css_width = window.width() / pointer_scale(window).x;
+    let mut pressed = None;
+    let mut finger = gesture.touch;
+    for touch in touches.iter_just_pressed() {
+        if joystick.touch.is_none() && touch.position().x < css_width * JOYSTICK_ZONE {
+            *joystick = Joystick {
+                touch: Some(touch.id()),
+                origin: touch.position(),
+                current: touch.position(),
+            };
+        } else if finger.is_none() && gesture.start.is_none() {
+            finger = Some(touch.id());
+            pressed = Some((finger, touch.position()));
+        }
+    }
+    if let Some(id) = joystick.touch {
+        match touches.get_pressed(id) {
+            Some(touch) => joystick.current = touch.position(),
+            None => *joystick = Joystick::default(),
+        }
+    }
+
+    if let Some(id) = finger {
         return PointerFrame {
-            pressed: touches.iter_just_pressed().next().map(|touch| touch.position()),
-            held: touches.iter().next().map(|touch| touch.position()),
-            released: touches.iter_just_released().next().is_some()
-                || touches.iter_just_canceled().next().is_some(),
+            pressed,
+            held: touches.get_pressed(id).map(|touch| touch.position()),
+            released: touches.just_released(id) || touches.just_canceled(id),
         };
+    }
+    if touches.iter().next().is_some() || touches.iter_just_released().next().is_some() {
+        return PointerFrame::default();
     }
     let cursor = window.cursor_position();
     PointerFrame {
-        pressed: cursor.filter(|_| mouse.just_pressed(MouseButton::Left)),
+        pressed: cursor.filter(|_| mouse.just_pressed(MouseButton::Left)).map(|p| (None, p)),
         held: cursor.filter(|_| mouse.pressed(MouseButton::Left)),
         released: mouse.just_released(MouseButton::Left),
     }
@@ -725,55 +896,108 @@ fn throw_held(hand: &mut Hand, bodies: &mut Bodies, camera: &Transform, now: f32
     *hand = Hand::default();
 }
 
+/// Ce que vise un point de l'écran : un objet à attraper en priorité, sinon une cible à toucher.
+#[derive(Clone, Copy)]
+enum Target {
+    Grab(Entity),
+    Touch(Entity),
+}
+
+impl Target {
+    fn act(self, hand: &mut Hand, bodies: &mut Bodies, taps: &mut Taps, armed: bool) {
+        match self {
+            Self::Grab(entity) => grab(hand, bodies, entity, armed),
+            Self::Touch(entity) => taps.0.push(entity),
+        }
+    }
+}
+
 fn handle_pointer(
     time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
     touches: Res<Touches>,
     window: Single<&Window>,
     cursor: Single<&CursorOptions>,
+    mode: Res<GameMode>,
     camera: Single<(&mut Player, &Transform, &Camera, &GlobalTransform)>,
-    trash: Query<(Entity, &Transform), (With<Trash>, Without<Player>)>,
+    grabbables: Query<(Entity, &Transform), (With<Grabbable>, Without<Player>)>,
+    touchables: Query<(Entity, &Transform, &Touchable), Without<Player>>,
     mut bodies: Bodies,
     mut hand: ResMut<Hand>,
     mut gesture: ResMut<Gesture>,
+    mut joystick: ResMut<Joystick>,
     mut game: ResMut<Game>,
+    mut taps: ResMut<Taps>,
     mut crosshair: Single<&mut BackgroundColor, With<Crosshair>>,
 ) {
     let (mut player, transform, camera, camera_transform) = camera.into_inner();
     let now = time.elapsed_secs();
-    // Déchet à portée le plus proche d'un point de l'écran.
-    let near = |point: Vec2, tolerance: f32| {
-        trash
+    let closest = |candidates: Vec<(Entity, f32)>| {
+        candidates.into_iter().min_by(|a, b| a.1.total_cmp(&b.1)).map(|(entity, _)| entity)
+    };
+    let target = |point: Vec2, tolerance: f32, reach: f32| {
+        let in_reach = |item: &Transform| item.translation.distance(transform.translation) < reach;
+        let grab = grabbables
             .iter()
-            .filter(|(_, item)| item.translation.distance(transform.translation) < REACH)
+            .filter(|(_, item)| in_reach(item))
             .filter_map(|(entity, item)| {
                 let on_screen = camera.world_to_viewport(camera_transform, item.translation).ok()?;
-                Some((entity, on_screen.distance(point)))
+                let distance = on_screen.distance(point);
+                (distance < tolerance).then_some((entity, distance))
             })
-            .filter(|(_, distance)| *distance < tolerance)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(entity, _)| entity)
+            .collect();
+        // Une cible touchable est sensible sur tout son rayon à l'écran (le tableau fait 3 m).
+        let touch = touchables
+            .iter()
+            .filter(|(_, item, _)| in_reach(item))
+            .filter_map(|(entity, item, touchable)| {
+                let center = camera.world_to_viewport(camera_transform, item.translation).ok()?;
+                let edge = item.translation + camera_transform.right() * touchable.radius;
+                let radius = camera.world_to_viewport(camera_transform, edge).ok()?.distance(center);
+                let distance = center.distance(point);
+                (distance < tolerance.max(radius)).then_some((entity, distance))
+            })
+            .collect();
+        closest(grab).map(Target::Grab).or_else(|| closest(touch).map(Target::Touch))
+    };
+    // Rien à portée sous le doigt ou le viseur, mais un objet plus loin : on le dit.
+    let too_far = |game: &mut Game, point: Vec2, tolerance: f32| {
+        if target(point, tolerance, f32::INFINITY).is_some() {
+            game.message = "Trop loin : approchez-vous.".into();
+            game.message_error = false;
+            game.message_until = now + 1.5;
+        }
     };
     let center = window.size() / 2.0;
-    let aimed = || near(center, CROSSHAIR_TOLERANCE);
+    let aimed = || target(center, CROSSHAIR_TOLERANCE, mode.reach());
     crosshair.0 = if hand.held.is_none() && aimed().is_some() {
         CROSSHAIR_TARGET
     } else {
         CROSSHAIR_IDLE
     };
 
-    if pointer_locked(&cursor) {
-        if game.finished_at.is_some() && mouse.just_pressed(MouseButton::Left) {
+    // Après la fin : Bureau propre sur le web attend un toucher pour valider l'étape (le temps de
+    // lire le débrief) ; sinon on rejoue.
+    let after_finish = |game: &mut Game| {
+        if *mode == GameMode::CleanDesk && !USE_POINTER_LOCK {
+            game.continue_requested = true;
+        } else {
             game.restart_requested = true;
         }
+    };
+
+    if pointer_locked(&cursor) {
+        if game.finished_at.is_some() && mouse.just_pressed(MouseButton::Left) {
+            after_finish(&mut game);
+        }
         match hand.held {
-            None => {
-                if mouse.just_pressed(MouseButton::Left)
-                    && let Some(entity) = aimed()
-                {
-                    grab(&mut hand, &mut bodies, entity, false);
+            None if mouse.just_pressed(MouseButton::Left) && game.finished_at.is_none() => {
+                match aimed() {
+                    Some(target) => target.act(&mut hand, &mut bodies, &mut taps, false),
+                    None => too_far(&mut game, center, CROSSHAIR_TOLERANCE),
                 }
             }
+            None => {}
             Some(_) if !hand.armed => hand.armed = !mouse.pressed(MouseButton::Left),
             Some(_) => {
                 if mouse.just_pressed(MouseButton::Right) {
@@ -789,9 +1013,10 @@ fn handle_pointer(
     }
 
     // Geste : glisser pour regarder, toucher pour ramasser, appui long puis relâcher pour lancer.
-    let pointer = read_pointer(&touches, &mouse, &window);
-    if let Some(position) = pointer.pressed {
+    let pointer = read_pointer(&touches, &mouse, &window, &gesture, &mut joystick);
+    if let Some((touch, position)) = pointer.pressed {
         *gesture = Gesture {
+            touch,
             start: Some(position),
             last: position,
             dragging: false,
@@ -816,17 +1041,43 @@ fn handle_pointer(
     if pointer.released {
         if !gesture.dragging {
             if game.finished_at.is_some() {
-                game.restart_requested = true;
+                after_finish(&mut game);
             } else if hand.held.is_some() {
                 throw_held(&mut hand, &mut bodies, transform, now);
-            } else if let scale = pointer_scale(&window)
-                && let Some(entity) = near(gesture.last * scale, TOUCH_TOLERANCE * scale.x)
-            {
-                grab(&mut hand, &mut bodies, entity, true);
+            } else {
+                let scale = pointer_scale(&window);
+                let (point, tolerance) = (gesture.last * scale, TOUCH_TOLERANCE * scale.x);
+                match target(point, tolerance, mode.reach()) {
+                    Some(target) => target.act(&mut hand, &mut bodies, &mut taps, true),
+                    None => too_far(&mut game, point, tolerance),
+                }
             }
         }
         gesture.start = None;
+        gesture.touch = None;
     }
+}
+
+/// Le joystick n'apparaît que sous le pouce, pendant qu'on marche.
+fn update_joystick_ui(
+    joystick: Res<Joystick>,
+    window: Single<&Window>,
+    mut base: Single<(&mut Node, &mut Visibility), (With<JoystickBase>, Without<JoystickKnob>)>,
+    mut knob: Single<&mut Node, (With<JoystickKnob>, Without<JoystickBase>)>,
+) {
+    let (node, visibility) = &mut *base;
+    if joystick.touch.is_none() {
+        **visibility = Visibility::Hidden;
+        return;
+    }
+    **visibility = Visibility::Inherited;
+    let scale = pointer_scale(&window);
+    let origin = joystick.origin * scale;
+    let offset = (joystick.current - joystick.origin).clamp_length_max(JOYSTICK_RADIUS) * scale;
+    node.left = Val::Px(origin.x - JOYSTICK_RADIUS);
+    node.top = Val::Px(origin.y - JOYSTICK_RADIUS);
+    knob.left = Val::Px(JOYSTICK_RADIUS - 24.0 + offset.x);
+    knob.top = Val::Px(JOYSTICK_RADIUS - 24.0 + offset.y);
 }
 
 /// L'objet tenu est tiré vers un point devant la caméra : il reste soumis aux collisions.
@@ -873,37 +1124,46 @@ fn detect_in_bin(
         }
         let p = transform.translation - BIN_POS;
         if Vec2::new(p.x, p.z).length() < BIN_INNER && p.y > 0.0 && p.y < BIN_HEIGHT {
-            commands.entity(entity).remove::<Trash>().insert(InBin);
-            game.in_bin += 1;
+            commands.entity(entity).remove::<(Trash, Grabbable)>().insert(InBin);
+            game.done += 1;
+            game.message = "Dans la poubelle !".into();
             game.message_until = now + 1.5;
-            if game.in_bin == game.total {
+            if game.done == game.total {
                 game.finished_at = Some(now);
+                game.points = 2000;
             }
         }
     }
 }
 
-/// Valide l'étape GeoGaming deux secondes après la fin, le temps de lire le message.
-fn notify_geogaming(time: Res<Time>, mut game: ResMut<Game>) {
+/// Valide l'étape GeoGaming : Trash Toss deux secondes après la fin, le temps de lire le message ;
+/// Bureau propre quand le joueur a lu le débrief et touché l'écran.
+fn notify_geogaming(time: Res<Time>, mode: Res<GameMode>, mut game: ResMut<Game>) {
     let Some(end) = game.finished_at else { return };
-    if game.notified || time.elapsed_secs() < end + 2.0 {
+    let ready = match *mode {
+        GameMode::Trash => time.elapsed_secs() >= end + 2.0,
+        GameMode::CleanDesk => game.continue_requested,
+    };
+    if game.notified || !ready {
         return;
     }
     game.notified = true;
     let seconds = end - game.started_at;
-    info!("Bureau propre en {seconds:.1} s : étape validée");
+    info!("{} : terminé en {seconds:.1} s, {} points, étape validée", mode.activity_key(), game.points);
     #[cfg(target_arch = "wasm32")]
-    web::notify_completed(seconds);
+    web::notify_completed(mode.activity_key(), seconds, game.points);
 }
 
 fn restart(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
-    items: Query<Entity, Or<(With<Trash>, With<InBin>)>>,
+    mode: Res<GameMode>,
+    items: Query<Entity, With<RoundEntity>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut hand: ResMut<Hand>,
+    mut taps: ResMut<Taps>,
     mut game: ResMut<Game>,
 ) {
     if !keys.just_pressed(KeyCode::KeyR) && !game.restart_requested {
@@ -913,12 +1173,44 @@ fn restart(
         commands.entity(entity).despawn();
     }
     *hand = Hand::default();
-    spawn_trash(&mut commands, &mut meshes, &mut materials, &mut game, time.elapsed_secs());
+    taps.0.clear();
+    let now = time.elapsed_secs();
+    match *mode {
+        GameMode::Trash => spawn_trash(&mut commands, &mut meshes, &mut materials, &mut game, now),
+        GameMode::CleanDesk => clean_desk::spawn_round(&mut commands, &mut meshes, &mut materials, &mut game, now),
+    }
 }
 
 // ---------- Interface ----------
 
-fn setup_ui(mut commands: Commands) {
+fn setup_ui(mut commands: Commands, mode: Res<GameMode>) {
+    commands
+        .spawn((
+            JoystickBase,
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Px(2.0 * JOYSTICK_RADIUS),
+                height: Val::Px(2.0 * JOYSTICK_RADIUS),
+                border_radius: BorderRadius::MAX,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.15)),
+            Visibility::Hidden,
+        ))
+        .with_children(|base| {
+            base.spawn((
+                JoystickKnob,
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Px(48.0),
+                    height: Val::Px(48.0),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.6)),
+            ));
+        });
+
     commands.spawn((
         Crosshair,
         Node {
@@ -967,12 +1259,17 @@ fn setup_ui(mut commands: Commands) {
                 MessageText,
                 Text::new(""),
                 TextFont {
-                    font_size: FontSize::Px(40.0),
+                    // Bureau propre explique chaque règle en une phrase : plus petit.
+                    font_size: FontSize::Px(if *mode == GameMode::Trash { 40.0 } else { 24.0 }),
                     ..default()
                 },
                 TextColor(Color::srgb(1.0, 0.85, 0.2)),
                 TextLayout::justify(Justify::Center),
                 TextShadow::default(),
+                Node {
+                    max_width: Val::Percent(90.0),
+                    ..default()
+                },
             ));
         });
 
@@ -1020,13 +1317,22 @@ fn setup_ui(mut commands: Commands) {
         })
         .with_children(|row| {
             row.spawn((
-                Text::new(if USE_POINTER_LOCK {
-                    "Clic : ramasser | Maintenir puis relâcher : lancer | Clic droit : lâcher | ZQSD : marcher | R : rejouer | Échap : souris"
-                } else {
-                    "Touchez un déchet pour l'attraper | Glissez pour viser\nMaintenez puis relâchez pour lancer"
+                Text::new(match (*mode, USE_POINTER_LOCK) {
+                    (GameMode::Trash, true) => {
+                        "Clic : ramasser | Maintenir puis relâcher : lancer | Clic droit : lâcher | ZQSD : marcher | R : rejouer | Échap : souris"
+                    }
+                    (GameMode::Trash, false) => {
+                        "Touchez un déchet : l'attraper | Glissez : viser\nAppui long puis relâcher : lancer | Pouce à gauche : avancer"
+                    }
+                    (GameMode::CleanDesk, true) => {
+                        "ZQSD : marcher | Clic sur un objet proche : le prendre ou agir | Maintenir puis relâcher : lancer dans un bac | R : rejouer | Échap : souris"
+                    }
+                    (GameMode::CleanDesk, false) => {
+                        "Pouce à gauche : marcher | Glissez : regarder\nTouchez un objet proche : le prendre\nAppui long puis relâcher : lancer dans un bac"
+                    }
                 }),
                 TextFont {
-                    font_size: FontSize::Px(16.0),
+                    font_size: FontSize::Px(if USE_POINTER_LOCK { 16.0 } else { 14.0 }),
                     ..default()
                 },
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
@@ -1053,13 +1359,13 @@ fn update_ui(
     let elapsed = game.finished_at.unwrap_or(now) - game.started_at;
     score.0 = format!(
         "Déchets jetés : {} / {}\nTemps : {:.0} s",
-        game.in_bin, game.total, elapsed
+        game.done, game.total, elapsed
     );
     message.0 = if game.finished_at.is_some() {
         let replay = if USE_POINTER_LOCK { "Clic ou R pour rejouer" } else { "Touchez pour rejouer" };
-        format!("Bureau propre en {elapsed:.1} s !\n{replay}")
+        format!("Tout est à la poubelle en {elapsed:.1} s !\n{replay}")
     } else if now < game.message_until {
-        "Dans la poubelle !".into()
+        game.message.clone()
     } else {
         String::new()
     };
