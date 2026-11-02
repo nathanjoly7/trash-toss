@@ -23,7 +23,8 @@ Jouer en ligne :
 ## Commandes
 
 - PC (natif) : ZQSD pour marcher, souris pour regarder, clic pour prendre ou agir, maintenir puis relâcher pour lancer.
-- Web et téléphone : pouce qui glisse depuis le tiers gauche de l'écran pour marcher (joystick ; un simple toucher à gauche reste un toucher), glisser ailleurs pour regarder, toucher un objet pour le prendre, appui long puis relâcher pour lancer. ZQSD marche aussi au clavier.
+- Web à la souris : un clic dans le jeu capture la souris (vue FPS comme sur PC, Échap pour la libérer). Si le navigateur refuse trois fois, on revient au cliquer-glisser pour regarder.
+- Web au doigt : pouce qui glisse depuis le tiers gauche de l'écran pour marcher (joystick ; un simple toucher à gauche reste un toucher), glisser ailleurs pour regarder, toucher un objet pour le prendre, appui long puis relâcher pour lancer.
 
 ## Lancer
 

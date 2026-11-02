@@ -11,9 +11,9 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions},
 };
 
-/// Natif : vue FPS, souris capturée. Web (souvent dans une iframe GeoGaming, souvent au doigt) :
-/// pas de capture, on glisse pour regarder et on touche un déchet pour le ramasser.
-const USE_POINTER_LOCK: bool = !cfg!(target_arch = "wasm32");
+/// Natif : vue FPS, souris capturée dès le départ. Web : souris capturée au premier clic dans le
+/// jeu (Échap la rend) ; au doigt, on glisse pour regarder et on touche un objet pour le prendre.
+const NATIVE: bool = !cfg!(target_arch = "wasm32");
 const DRAG_THRESHOLD: f32 = 12.0;
 /// Un déchet de 7 cm est trop petit pour un doigt : on prend le plus proche à l'écran.
 const TOUCH_TOLERANCE: f32 = 56.0;
@@ -133,6 +133,33 @@ struct Touchable {
 #[derive(Resource, Default)]
 struct Taps(Vec<Entity>);
 
+/// Capture de la souris sur le web : demandée au clic, accordée ou non par le navigateur.
+#[derive(Resource, Default)]
+struct MouseLook {
+    requested_at: Option<f32>,
+    /// Demandes restées sans réponse : à trois, on garde le geste (cliquer-glisser pour regarder).
+    /// Pas moins : Chrome refuse parfois une nouvelle capture juste après un Échap.
+    failures: u32,
+}
+
+impl MouseLook {
+    fn available(&self) -> bool {
+        !NATIVE && self.failures < 3
+    }
+}
+
+/// Souris et clavier, ou écran tactile : choisit les consignes affichées.
+fn uses_mouse() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web::has_fine_pointer()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        true
+    }
+}
+
 #[derive(Component)]
 struct Trash;
 
@@ -204,12 +231,16 @@ mod web {
         seconds: Math.round(seconds) }, '*'); } \
         export function canvas_css_width() { return document.getElementById('bevy')?.clientWidth ?? 0; } \
         export function canvas_css_height() { return document.getElementById('bevy')?.clientHeight ?? 0; } \
-        export function game_param() { return new URLSearchParams(location.search).get('jeu') ?? ''; }")]
+        export function game_param() { return new URLSearchParams(location.search).get('jeu') ?? ''; } \
+        export function is_pointer_locked() { return document.pointerLockElement != null; } \
+        export function has_fine_pointer() { return window.matchMedia('(pointer: fine)').matches; }")]
     extern "C" {
         pub fn notify_completed(key: &str, seconds: f32, points: u32);
         pub fn canvas_css_width() -> f64;
         pub fn canvas_css_height() -> f64;
         pub fn game_param() -> String;
+        pub fn is_pointer_locked() -> bool;
+        pub fn has_fine_pointer() -> bool;
     }
 }
 
@@ -267,6 +298,7 @@ fn main() {
         .init_resource::<Game>()
         .init_resource::<Gesture>()
         .init_resource::<Joystick>()
+        .init_resource::<MouseLook>()
         .init_resource::<Taps>()
         .add_systems(
             Startup,
@@ -410,7 +442,7 @@ fn setup_office(
                 intensity: 250_000.0,
                 range: 14.0,
                 // Quatre ombres omnidirectionnelles coûtent trop cher sur un téléphone.
-                shadow_maps_enabled: USE_POINTER_LOCK || i == 3,
+                shadow_maps_enabled: NATIVE || i == 3,
                 ..default()
             },
             Transform::from_xyz(x, h - 0.35, z),
@@ -688,7 +720,7 @@ fn setup_player(mut commands: Commands, mode: Res<GameMode>) {
             ..default()
         }),
         // Écrans de téléphone très denses : l'anticrénelage y coûte plus qu'il ne rapporte.
-        if USE_POINTER_LOCK { Msaa::Sample4 } else { Msaa::Off },
+        if NATIVE { Msaa::Sample4 } else { Msaa::Off },
         Transform::from_xyz(0.0, EYE_HEIGHT, 6.5),
     ));
 }
@@ -710,32 +742,67 @@ fn fit_fov(window: Single<&Window>, mut projection: Single<&mut Projection, With
     }
 }
 
+/// Sur le web, seul le navigateur sait si la souris est capturée (Échap la rend sans prévenir).
 fn pointer_locked(cursor: &CursorOptions) -> bool {
-    USE_POINTER_LOCK && cursor.grab_mode != CursorGrabMode::None
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = cursor;
+        web::is_pointer_locked()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        cursor.grab_mode != CursorGrabMode::None
+    }
 }
 
 fn lock_cursor(mut cursor: Single<&mut CursorOptions>) {
-    if USE_POINTER_LOCK {
+    if NATIVE {
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;
     }
 }
 
-/// Échap libère la souris, un clic dans la fenêtre la reprend.
+/// Natif : Échap libère la souris, un clic la reprend. Web : un clic demande la capture au
+/// navigateur, Échap la rend ; si le navigateur la refuse trois fois, on garde le geste.
 fn toggle_cursor(
+    time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
     mut cursor: Single<&mut CursorOptions>,
+    mut mouse_look: ResMut<MouseLook>,
 ) {
-    if !USE_POINTER_LOCK {
+    let clicked = mouse.just_pressed(MouseButton::Left);
+    if NATIVE {
+        if keys.just_pressed(KeyCode::Escape) {
+            cursor.grab_mode = CursorGrabMode::None;
+            cursor.visible = true;
+        } else if clicked && cursor.grab_mode == CursorGrabMode::None {
+            cursor.grab_mode = CursorGrabMode::Locked;
+            cursor.visible = false;
+        }
         return;
     }
-    if keys.just_pressed(KeyCode::Escape) {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
-    } else if mouse.just_pressed(MouseButton::Left) && cursor.grab_mode == CursorGrabMode::None {
-        cursor.grab_mode = CursorGrabMode::Locked;
-        cursor.visible = false;
+
+    let now = time.elapsed_secs();
+    if pointer_locked(&cursor) {
+        *mouse_look = MouseLook::default();
+        return;
+    }
+    match mouse_look.requested_at {
+        Some(at) if now - at > 0.8 => {
+            mouse_look.requested_at = None;
+            mouse_look.failures += 1;
+            cursor.grab_mode = CursorGrabMode::None;
+        }
+        Some(_) => {}
+        // Rendue par le navigateur : on se remet d'accord avec lui pour pouvoir la redemander.
+        None if cursor.grab_mode != CursorGrabMode::None => cursor.grab_mode = CursorGrabMode::None,
+        None if clicked && mouse_look.available() && touches.iter().next().is_none() => {
+            cursor.grab_mode = CursorGrabMode::Locked;
+            mouse_look.requested_at = Some(now);
+        }
+        None => {}
     }
 }
 
@@ -920,8 +987,7 @@ fn handle_pointer(
     touchables: Query<(Entity, &Transform, &Touchable), Without<Player>>,
     mut bodies: Bodies,
     mut hand: ResMut<Hand>,
-    mut gesture: ResMut<Gesture>,
-    mut joystick: ResMut<Joystick>,
+    (mut gesture, mut joystick, mouse_look): (ResMut<Gesture>, ResMut<Joystick>, Res<MouseLook>),
     mut game: ResMut<Game>,
     mut taps: ResMut<Taps>,
     mut crosshair: Single<&mut BackgroundColor, With<Crosshair>>,
@@ -975,7 +1041,7 @@ fn handle_pointer(
     // Après la fin : Bureau propre sur le web attend un toucher pour valider l'étape (le temps de
     // lire le débrief) ; sinon on rejoue.
     let after_finish = |game: &mut Game| {
-        if *mode == GameMode::CleanDesk && !USE_POINTER_LOCK {
+        if *mode == GameMode::CleanDesk && !NATIVE {
             game.continue_requested = true;
         } else {
             game.restart_requested = true;
@@ -1009,6 +1075,15 @@ fn handle_pointer(
     }
 
     // Geste : glisser pour regarder, toucher pour ramasser, appui long puis relâcher pour lancer.
+    // Web à la souris : le clic demande la capture (toggle_cursor), il ne prend rien.
+    let mouse_click = mouse.just_pressed(MouseButton::Left) && touches.iter().next().is_none();
+    if mouse_click && mouse_look.available() && gesture.start.is_none() {
+        if game.finished_at.is_some() {
+            after_finish(&mut game);
+        }
+        return;
+    }
+
     let pointer = read_pointer(&touches, &mouse, &window, &gesture, &mut joystick);
     if let Some((touch, position)) = pointer.pressed {
         let css_width = window.width() / pointer_scale(&window).x;
@@ -1192,6 +1267,7 @@ fn restart(
 // ---------- Interface ----------
 
 fn setup_ui(mut commands: Commands, mode: Res<GameMode>) {
+    let mouse = uses_mouse();
     commands
         .spawn((
             JoystickBase,
@@ -1325,22 +1401,28 @@ fn setup_ui(mut commands: Commands, mode: Res<GameMode>) {
         })
         .with_children(|row| {
             row.spawn((
-                Text::new(match (*mode, USE_POINTER_LOCK) {
-                    (GameMode::Trash, true) => {
+                Text::new(match (*mode, NATIVE, mouse) {
+                    (GameMode::Trash, true, _) => {
                         "Clic : ramasser | Maintenir puis relâcher : lancer | Clic droit : lâcher | ZQSD : marcher | R : rejouer | Échap : souris"
                     }
-                    (GameMode::Trash, false) => {
+                    (GameMode::Trash, false, true) => {
+                        "Cliquez dans le jeu pour viser à la souris (Échap pour la libérer)\nClic : ramasser | Maintenir puis relâcher : lancer | ZQSD : avancer"
+                    }
+                    (GameMode::Trash, false, false) => {
                         "Touchez un déchet : l'attraper | Glissez : viser\nAppui long puis relâcher : lancer\nPouce glissé à gauche : avancer"
                     }
-                    (GameMode::CleanDesk, true) => {
+                    (GameMode::CleanDesk, true, _) => {
                         "ZQSD : marcher | Clic sur un objet proche : le prendre ou agir | Maintenir puis relâcher : lancer dans un bac | R : rejouer | Échap : souris"
                     }
-                    (GameMode::CleanDesk, false) => {
+                    (GameMode::CleanDesk, false, true) => {
+                        "Cliquez dans le jeu pour regarder à la souris (Échap pour la libérer)\nZQSD : marcher | Clic sur un objet proche : le prendre | Maintenir puis relâcher : lancer"
+                    }
+                    (GameMode::CleanDesk, false, false) => {
                         "Pouce à gauche : marcher | À droite : regarder\nTouchez un objet proche : le prendre\nAppui long puis relâcher : lancer dans un bac"
                     }
                 }),
                 TextFont {
-                    font_size: FontSize::Px(if USE_POINTER_LOCK { 16.0 } else { 14.0 }),
+                    font_size: FontSize::Px(if mouse { 16.0 } else { 14.0 }),
                     ..default()
                 },
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
@@ -1370,7 +1452,7 @@ fn update_ui(
         game.done, game.total, elapsed
     );
     message.0 = if game.finished_at.is_some() {
-        let replay = if USE_POINTER_LOCK { "Clic ou R pour rejouer" } else { "Touchez pour rejouer" };
+        let replay = if NATIVE { "Clic ou R pour rejouer" } else { "Touchez ou cliquez pour rejouer" };
         format!("Tout est à la poubelle en {elapsed:.1} s !\n{replay}")
     } else if now < game.message_until {
         game.message.clone()

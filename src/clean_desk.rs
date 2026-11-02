@@ -5,8 +5,8 @@ use avian3d::prelude::*;
 use bevy::prelude::*;
 
 use crate::{
-    Game, Grabbable, Hand, MessageText, Obstacle, Player, RoundEntity, ScoreText, Taps, Touchable,
-    USE_POINTER_LOCK,
+    Game, Grabbable, Hand, MessageText, NATIVE, Obstacle, Player, RoundEntity, ScoreText, Taps,
+    Touchable,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -302,10 +302,10 @@ fn spawn_ui(commands: &mut Commands) {
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.9)),
             ));
             panel.spawn((
-                Text::new(if USE_POINTER_LOCK {
+                Text::new(if NATIVE {
                     "Clic ou R pour rejouer"
                 } else {
-                    "Touchez l'écran pour continuer"
+                    "Touchez ou cliquez pour continuer"
                 }),
                 TextFont {
                     font_size: FontSize::Px(16.0),
