@@ -89,8 +89,8 @@ enum Step {
 }
 
 const SCRIPT: [(f32, Step); 9] = [
-    (1.5, Step::Choose("Clé USB trouvée par terre", |o| matches!(o, Outcome::Wrong(_)))),
-    (1.5, Step::Choose("Clé USB trouvée par terre", |o| matches!(o, Outcome::Right(..)))),
+    (1.5, Step::Choose("Clé USB inconnue près du PC", |o| matches!(o, Outcome::Wrong(_)))),
+    (1.5, Step::Choose("Clé USB inconnue près du PC", |o| matches!(o, Outcome::Right(..)))),
     (1.5, Step::Choose("Session ouverte", |o| matches!(o, Outcome::Right(..)))),
     (1.5, Step::Choose("Tableau blanc du projet", |o| matches!(o, Outcome::Right(..)))),
     (1.5, Step::Choose("Post-it avec un mot de passe", |o| matches!(o, Outcome::Take))),

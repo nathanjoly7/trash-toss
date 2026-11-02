@@ -495,9 +495,10 @@ pub(crate) fn spawn_round(
             }
         });
 
-    // 3. Clé USB trouvée par terre : elle ne se prend pas, elle part au service informatique.
+    // 3. Clé USB inconnue posée à côté du PC resté allumé (bureau de droite) : elle ne se prend
+    // pas, elle part au service informatique. À droite de l'écran, pour ne pas le masquer au clic.
     let (menu, outcomes) = choices(
-        "Clé USB trouvée par terre",
+        "Clé USB inconnue près du PC",
         &[
             (
                 "La brancher pour trouver son propriétaire",
@@ -515,7 +516,7 @@ pub(crate) fn spawn_round(
             Touchable { radius: 0.06 },
             menu,
             Risk {
-                label: "Clé USB trouvée par terre",
+                label: "Clé USB inconnue près du PC",
                 destination: None,
                 success: "",
                 wrong: "",
@@ -527,7 +528,7 @@ pub(crate) fn spawn_round(
                 emissive: LinearRgba::rgb(0.15, 0.04, 0.0),
                 ..default()
             })),
-            Transform::from_xyz(-2.0, 0.008, 5.3).with_rotation(Quat::from_rotation_y(0.7)),
+            Transform::from_xyz(5.6, 0.768, 2.47).with_rotation(Quat::from_rotation_y(0.4)),
         ))
         .with_children(|key| {
             key.spawn((

@@ -10,7 +10,7 @@ Deux prototypes Bevy 0.20 + avian3d 0.8 dans le même bureau en 3D, un seul expo
 | --- | --- | --- | --- |
 | Post-it avec un mot de passe | écran du bureau de gauche | Prendre, puis le lancer dans la broyeuse | Le cacher sous le clavier |
 | Contrat client signé | sur l'imprimante | Prendre, puis le ranger dans l'armoire | Le retourner face cachée |
-| Clé USB inconnue | par terre | L'envoyer au service informatique | La brancher pour trouver son propriétaire |
+| Clé USB inconnue | sur le bureau de droite, à côté du PC allumé | L'envoyer au service informatique | La brancher pour trouver son propriétaire |
 | Session ouverte | écran du bureau de droite | Verrouiller la session | Éteindre l'écran |
 | Tableau blanc du projet | mur du fond | Effacer | Le prendre en photo pour plus tard |
 
