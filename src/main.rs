@@ -186,6 +186,8 @@ struct Game {
 struct Gesture {
     /// Doigt qui fait le geste ; `None` pour la souris.
     touch: Option<u64>,
+    /// Posé dans le tiers gauche : s'il glisse, il devient le joystick ; sinon c'est un toucher.
+    left_zone: bool,
     start: Option<Vec2>,
     last: Vec2,
     dragging: bool,
@@ -803,8 +805,9 @@ struct PointerFrame {
     released: bool,
 }
 
-/// Répartit les doigts : le premier posé dans le tiers gauche pilote le joystick, un autre fait
-/// le geste. Sans doigt sur l'écran, la souris non capturée fait le geste.
+/// Suit le doigt du geste et celui du joystick. Un nouveau doigt devient le geste ; s'il glisse
+/// depuis le tiers gauche, `handle_pointer` le passe au joystick. Sans doigt sur l'écran, la
+/// souris non capturée fait le geste.
 fn read_pointer(
     touches: &Touches,
     mouse: &ButtonInput<MouseButton>,
@@ -812,17 +815,10 @@ fn read_pointer(
     gesture: &Gesture,
     joystick: &mut Joystick,
 ) -> PointerFrame {
-    let css_width = window.width() / pointer_scale(window).x;
     let mut pressed = None;
     let mut finger = gesture.touch;
     for touch in touches.iter_just_pressed() {
-        if joystick.touch.is_none() && touch.position().x < css_width * JOYSTICK_ZONE {
-            *joystick = Joystick {
-                touch: Some(touch.id()),
-                origin: touch.position(),
-                current: touch.position(),
-            };
-        } else if finger.is_none() && gesture.start.is_none() {
+        if finger.is_none() && gesture.start.is_none() && Some(touch.id()) != joystick.touch {
             finger = Some(touch.id());
             pressed = Some((finger, touch.position()));
         }
@@ -1015,8 +1011,10 @@ fn handle_pointer(
     // Geste : glisser pour regarder, toucher pour ramasser, appui long puis relâcher pour lancer.
     let pointer = read_pointer(&touches, &mouse, &window, &gesture, &mut joystick);
     if let Some((touch, position)) = pointer.pressed {
+        let css_width = window.width() / pointer_scale(&window).x;
         *gesture = Gesture {
             touch,
+            left_zone: touch.is_some() && position.x < css_width * JOYSTICK_ZONE,
             start: Some(position),
             last: position,
             dragging: false,
@@ -1028,8 +1026,18 @@ fn handle_pointer(
     let Some(start) = gesture.start else { return };
     if let Some(position) = pointer.held {
         if !gesture.dragging && position.distance(start) > DRAG_THRESHOLD {
-            gesture.dragging = true;
             hand.charge_start = None;
+            if gesture.left_zone && joystick.touch.is_none() {
+                // Le pouce glisse depuis la gauche : il marche, depuis l'endroit où il s'est posé.
+                *joystick = Joystick {
+                    touch: gesture.touch,
+                    origin: start,
+                    current: position,
+                };
+                *gesture = Gesture::default();
+                return;
+            }
+            gesture.dragging = true;
         }
         if gesture.dragging {
             let delta = position - gesture.last;
@@ -1322,13 +1330,13 @@ fn setup_ui(mut commands: Commands, mode: Res<GameMode>) {
                         "Clic : ramasser | Maintenir puis relâcher : lancer | Clic droit : lâcher | ZQSD : marcher | R : rejouer | Échap : souris"
                     }
                     (GameMode::Trash, false) => {
-                        "Touchez un déchet : l'attraper | Glissez : viser\nAppui long puis relâcher : lancer | Pouce à gauche : avancer"
+                        "Touchez un déchet : l'attraper | Glissez : viser\nAppui long puis relâcher : lancer\nPouce glissé à gauche : avancer"
                     }
                     (GameMode::CleanDesk, true) => {
                         "ZQSD : marcher | Clic sur un objet proche : le prendre ou agir | Maintenir puis relâcher : lancer dans un bac | R : rejouer | Échap : souris"
                     }
                     (GameMode::CleanDesk, false) => {
-                        "Pouce à gauche : marcher | Glissez : regarder\nTouchez un objet proche : le prendre\nAppui long puis relâcher : lancer dans un bac"
+                        "Pouce à gauche : marcher | À droite : regarder\nTouchez un objet proche : le prendre\nAppui long puis relâcher : lancer dans un bac"
                     }
                 }),
                 TextFont {
