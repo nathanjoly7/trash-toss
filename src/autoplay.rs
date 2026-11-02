@@ -1,14 +1,14 @@
 //! Test automatique (feature `autoplay`) : joue la partie tout seul, en passant par la vraie main,
 //! le vrai comptage et la vraie fin de partie.
 //! - Trash Toss : ramasse le déchet le plus proche et le lance en cloche vers la poubelle.
-//! - Bureau propre : vise d'abord exprès le mauvais bac avec le contrat (l'erreur doit être comptée
-//!   et l'objet renvoyé), puis trie chaque objet dans le bon bac et touche les deux cibles.
+//! - Bureau propre : passe par les vrais choix du menu et la vraie armoire, avec deux erreurs
+//!   volontaires (brancher la clé USB, ranger le post-it dans l'armoire) : 5 / 5, 1400 points.
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
 use crate::{
-    BIN_POS, Hand, Player, Taps, Touchable, Trash,
-    clean_desk::{Action, Destination, Receptacle, Risk},
+    BIN_POS, ContextMenu, Hand, MenuChoices, Player, Taps, Trash,
+    clean_desk::{Armoire, Destination, Outcome, Receptacle, Risk},
 };
 
 const GRAVITY: f32 = 9.81;
@@ -81,68 +81,63 @@ pub fn autoplay(
     }
 }
 
+/// Une étape du scénario de test : (pause avant l'étape suivante, action).
+enum Step {
+    Choose(&'static str, fn(&Outcome) -> bool),
+    PutInArmoire,
+    ThrowInShredder,
+}
+
+const SCRIPT: [(f32, Step); 9] = [
+    (1.5, Step::Choose("Clé USB trouvée par terre", |o| matches!(o, Outcome::Wrong(_)))),
+    (1.5, Step::Choose("Clé USB trouvée par terre", |o| matches!(o, Outcome::Right(..)))),
+    (1.5, Step::Choose("Session ouverte", |o| matches!(o, Outcome::Right(..)))),
+    (1.5, Step::Choose("Tableau blanc du projet", |o| matches!(o, Outcome::Right(..)))),
+    (1.5, Step::Choose("Post-it avec un mot de passe", |o| matches!(o, Outcome::Take))),
+    (1.0, Step::PutInArmoire),
+    (FLIGHT_SECS + 1.2, Step::ThrowInShredder),
+    (1.8, Step::Choose("Contrat client signé, confidentiel", |o| matches!(o, Outcome::Take))),
+    (1.5, Step::PutInArmoire),
+];
+
 pub fn autoplay_clean_desk(
     time: Res<Time>,
-    mut state: Local<(f32, bool)>,
+    mut state: Local<(f32, usize)>,
+    mut menu: ResMut<ContextMenu>,
     mut hand: ResMut<Hand>,
     mut taps: ResMut<Taps>,
-    camera: Single<&Transform, With<Player>>,
     receptacles: Query<(&Transform, &Receptacle), Without<Player>>,
-    mut items: Query<
-        (
-            Entity,
-            &Risk,
-            &mut Position,
-            &mut LinearVelocity,
-            &mut GravityScale,
-            &LinearDamping,
-        ),
-    >,
-    targets: Query<Entity, (With<Risk>, With<Touchable>)>,
+    risks: Query<(Entity, &Risk, &MenuChoices)>,
+    armoire: Query<Entity, With<Armoire>>,
+    mut bodies: Query<(&Position, &mut LinearVelocity, &mut GravityScale, &LinearDamping)>,
 ) {
-    let (next_action, wrong_done) = &mut *state;
+    let (next_action, step) = &mut *state;
     let now = time.elapsed_secs();
-    if now < 2.0 || now < *next_action {
+    if now < 2.0 || now < *next_action || armoire.is_empty() {
         return;
     }
-    match hand.held {
-        None => {
-            let first = items
-                .iter()
-                .find(|item| matches!(item.1.action, Action::Bring(_)))
-                .map(|item| item.0);
-            if let Some(entity) = first
-                && let Ok((_, _, mut position, mut velocity, mut gravity, _)) = items.get_mut(entity)
+    let Some((pause, action)) = SCRIPT.get(*step) else { return };
+    match action {
+        Step::Choose(title, wanted) => {
+            if let Some((entity, risk, _)) = risks.iter().find(|(_, _, choices)| choices.title == *title)
+                && let Some(index) = risk.outcomes.iter().position(wanted)
             {
-                position.0 = hold_point(&camera);
-                velocity.0 = Vec3::ZERO;
-                gravity.0 = 0.0;
-                hand.held = Some(entity);
-                hand.armed = true;
-                *next_action = now + 0.6;
-            } else if let Some(target) = targets.iter().next() {
-                taps.0.push(target);
-                *next_action = now + 1.5;
+                menu.chosen = Some((entity, index));
             }
         }
-        Some(entity) => {
-            if let Ok((_, risk, position, mut velocity, mut gravity, damping)) = items.get_mut(entity)
-                && let Action::Bring(expected) = risk.action
+        Step::PutInArmoire => taps.0.extend(armoire.iter()),
+        Step::ThrowInShredder => {
+            let shredder = receptacles.iter().find(|(_, r)| r.destination == Destination::Shredder);
+            if let Some(held) = hand.held
+                && let Some((zone, _)) = shredder
+                && let Ok((position, mut velocity, mut gravity, damping)) = bodies.get_mut(held)
             {
-                let aim = if expected == Destination::Cabinet && !*wrong_done {
-                    *wrong_done = true;
-                    Destination::Shredder
-                } else {
-                    expected
-                };
-                if let Some((zone, _)) = receptacles.iter().find(|(_, r)| r.destination == aim) {
-                    velocity.0 = ballistic(position.0, zone.translation, damping.0);
-                }
+                velocity.0 = ballistic(position.0, zone.translation, damping.0);
                 gravity.0 = 1.0;
+                *hand = Hand::default();
             }
-            *hand = Hand::default();
-            // Un objet renvoyé par le mauvais bac a besoin de plus de temps pour retomber.
-            *next_action = now + FLIGHT_SECS + 1.6;
         }
     }
+    *step += 1;
+    *next_action = now + pause;
 }

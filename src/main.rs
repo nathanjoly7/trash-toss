@@ -133,6 +133,81 @@ struct Touchable {
 #[derive(Resource, Default)]
 struct Taps(Vec<Entity>);
 
+/// Cible qui sert un objet en main : un clic dessus l'utilise au lieu de préparer un lancer.
+#[derive(Component)]
+struct UsableWhileHolding;
+
+/// Objet à choix : un clic ouvre un petit menu près du curseur au lieu de le prendre.
+#[derive(Component)]
+struct MenuChoices {
+    title: &'static str,
+    labels: Vec<&'static str>,
+}
+
+const MENU_WIDTH: f32 = 360.0;
+const MENU_PAD: f32 = 6.0;
+const MENU_TITLE: f32 = 28.0;
+/// Assez haut pour un libellé sur deux lignes.
+const MENU_ROW: f32 = 44.0;
+const MENU_GAP: f32 = 4.0;
+const MENU_KEYS: [(KeyCode, KeyCode); 4] = [
+    (KeyCode::Digit1, KeyCode::Numpad1),
+    (KeyCode::Digit2, KeyCode::Numpad2),
+    (KeyCode::Digit3, KeyCode::Numpad3),
+    (KeyCode::Digit4, KeyCode::Numpad4),
+];
+
+struct OpenMenu {
+    target: Entity,
+    title: &'static str,
+    labels: Vec<&'static str>,
+    /// Coin haut gauche, en pixels logiques, gardé dans l'écran.
+    origin: Vec2,
+}
+
+impl OpenMenu {
+    fn new(target: Entity, choices: &MenuChoices, near: Vec2, screen: Vec2) -> Self {
+        let height = 2.0 * MENU_PAD + MENU_TITLE + choices.labels.len() as f32 * (MENU_ROW + MENU_GAP);
+        // Au-dessus des consignes du bas de l'écran.
+        let origin = (near + Vec2::splat(16.0))
+            .min(screen - Vec2::new(MENU_WIDTH + 8.0, height + 70.0))
+            .max(Vec2::splat(8.0));
+        Self {
+            target,
+            title: choices.title,
+            labels: choices.labels.clone(),
+            origin,
+        }
+    }
+
+    fn row_rect(&self, index: usize) -> Rect {
+        let top = self.origin.y + MENU_PAD + MENU_TITLE + MENU_GAP + index as f32 * (MENU_ROW + MENU_GAP);
+        Rect::new(
+            self.origin.x + MENU_PAD,
+            top,
+            self.origin.x + MENU_WIDTH - MENU_PAD,
+            top + MENU_ROW,
+        )
+    }
+
+    fn hit(&self, point: Vec2) -> Option<usize> {
+        (0..self.labels.len()).find(|&index| self.row_rect(index).contains(point))
+    }
+}
+
+/// Menu ouvert, et choix fait cette image (lu puis vidé par le mode de jeu).
+#[derive(Resource, Default)]
+struct ContextMenu {
+    open: Option<OpenMenu>,
+    chosen: Option<(Entity, usize)>,
+}
+
+#[derive(Component)]
+struct MenuRoot;
+
+#[derive(Component)]
+struct MenuRow(usize);
+
 /// Capture de la souris sur le web : demandée au clic, accordée ou non par le navigateur.
 #[derive(Resource, Default)]
 struct MouseLook {
@@ -299,6 +374,7 @@ fn main() {
         .init_resource::<Gesture>()
         .init_resource::<Joystick>()
         .init_resource::<MouseLook>()
+        .init_resource::<ContextMenu>()
         .init_resource::<Taps>()
         .add_systems(
             Startup,
@@ -320,9 +396,16 @@ fn main() {
                 handle_pointer,
                 carry_held,
                 detect_in_bin.run_if(trash),
-                (clean_desk::sort_items, clean_desk::apply_taps).run_if(clean_desk),
+                (
+                    clean_desk::resolve_menu,
+                    clean_desk::sort_items,
+                    clean_desk::use_armoire,
+                    clean_desk::animate_doors,
+                )
+                    .run_if(clean_desk),
                 notify_geogaming,
                 update_joystick_ui,
+                sync_menu_ui,
                 update_ui.run_if(trash),
                 (clean_desk::update_ui, clean_desk::place_labels).run_if(clean_desk),
                 toggle_cursor,
@@ -331,7 +414,10 @@ fn main() {
                 .chain(),
         );
     #[cfg(feature = "autoplay")]
-    app.add_systems(Update, (autoplay::autoplay, autoplay::autoplay_clean_desk));
+    app.add_systems(
+        Update,
+        (autoplay::autoplay.run_if(trash), autoplay::autoplay_clean_desk.run_if(clean_desk)),
+    );
     app.run();
 }
 
@@ -967,61 +1053,113 @@ enum Target {
 }
 
 impl Target {
-    fn act(self, hand: &mut Hand, bodies: &mut Bodies, taps: &mut Taps, armed: bool) {
+    fn entity(self) -> Entity {
+        match self {
+            Self::Grab(entity) | Self::Touch(entity) => entity,
+        }
+    }
+
+    /// Ouvre le menu si l'objet en a un (renvoie vrai), sinon le prend ou le touche.
+    fn use_at(
+        self,
+        near: Vec2,
+        screen: Vec2,
+        armed: bool,
+        hand: &mut Hand,
+        bodies: &mut Bodies,
+        taps: &mut Taps,
+        menu: &mut ContextMenu,
+        menus: &Query<&MenuChoices>,
+    ) -> bool {
+        if let Ok(choices) = menus.get(self.entity()) {
+            menu.open = Some(OpenMenu::new(self.entity(), choices, near, screen));
+            return true;
+        }
         match self {
             Self::Grab(entity) => grab(hand, bodies, entity, armed),
             Self::Touch(entity) => taps.0.push(entity),
         }
+        false
     }
 }
 
 fn handle_pointer(
     time: Res<Time>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    touches: Res<Touches>,
-    window: Single<&Window>,
-    cursor: Single<&CursorOptions>,
+    (mouse, touches, keys): (Res<ButtonInput<MouseButton>>, Res<Touches>, Res<ButtonInput<KeyCode>>),
+    mut window: Single<&mut Window>,
+    mut cursor: Single<&mut CursorOptions>,
     mode: Res<GameMode>,
     camera: Single<(&mut Player, &Transform, &Camera, &GlobalTransform)>,
     grabbables: Query<(Entity, &Transform), (With<Grabbable>, Without<Player>)>,
-    touchables: Query<(Entity, &Transform, &Touchable), Without<Player>>,
+    touchables: Query<(Entity, &Transform, &Touchable, Has<UsableWhileHolding>), Without<Player>>,
+    menus: Query<&MenuChoices>,
     mut bodies: Bodies,
     mut hand: ResMut<Hand>,
     (mut gesture, mut joystick, mouse_look): (ResMut<Gesture>, ResMut<Joystick>, Res<MouseLook>),
-    mut game: ResMut<Game>,
-    mut taps: ResMut<Taps>,
+    (mut game, mut taps, mut menu): (ResMut<Game>, ResMut<Taps>, ResMut<ContextMenu>),
     mut crosshair: Single<&mut BackgroundColor, With<Crosshair>>,
 ) {
     let (mut player, transform, camera, camera_transform) = camera.into_inner();
     let now = time.elapsed_secs();
+    let screen = window.size();
+
+    // Menu ouvert : il prend tout. Un choix (clic, toucher, touches 1 à 4) ou un clic à côté le ferme.
+    if let Some(open) = &menu.open {
+        let press = if mouse.just_pressed(MouseButton::Left) {
+            window.cursor_position()
+        } else {
+            touches.iter_just_pressed().next().map(|touch| touch.position() * pointer_scale(&window))
+        };
+        let key = (0..open.labels.len())
+            .find(|&index| keys.any_just_pressed([MENU_KEYS[index].0, MENU_KEYS[index].1]));
+        let choice = key.or_else(|| press.and_then(|point| open.hit(point)));
+        let target = open.target;
+        if let Some(index) = choice {
+            menu.chosen = Some((target, index));
+            menu.open = None;
+        } else if press.is_some() || keys.just_pressed(KeyCode::Escape) || !menus.contains(target) {
+            menu.open = None;
+        }
+        *gesture = Gesture::default();
+        return;
+    }
+
     let closest = |candidates: Vec<(Entity, f32)>| {
         candidates.into_iter().min_by(|a, b| a.1.total_cmp(&b.1)).map(|(entity, _)| entity)
     };
-    let target = |point: Vec2, tolerance: f32, reach: f32| {
-        let in_reach = |item: &Transform| item.translation.distance(transform.translation) < reach;
-        let grab = grabbables
+    let touch_candidates = |point: Vec2, tolerance: f32, reach: f32, holding: bool| {
+        touchables
             .iter()
-            .filter(|(_, item)| in_reach(item))
-            .filter_map(|(entity, item)| {
-                let on_screen = camera.world_to_viewport(camera_transform, item.translation).ok()?;
-                let distance = on_screen.distance(point);
-                (distance < tolerance).then_some((entity, distance))
+            .filter(|(_, item, _, usable)| {
+                item.translation.distance(transform.translation) < reach && (!holding || *usable)
             })
-            .collect();
-        // Une cible touchable est sensible sur tout son rayon à l'écran (le tableau fait 3 m).
-        let touch = touchables
-            .iter()
-            .filter(|(_, item, _)| in_reach(item))
-            .filter_map(|(entity, item, touchable)| {
+            .filter_map(|(entity, item, touchable, _)| {
+                // Sensible sur tout son rayon à l'écran (le tableau fait 3 m, l'armoire 1,4 m).
                 let center = camera.world_to_viewport(camera_transform, item.translation).ok()?;
                 let edge = item.translation + camera_transform.right() * touchable.radius;
                 let radius = camera.world_to_viewport(camera_transform, edge).ok()?.distance(center);
                 let distance = center.distance(point);
                 (distance < tolerance.max(radius)).then_some((entity, distance))
             })
-            .collect();
-        closest(grab).map(Target::Grab).or_else(|| closest(touch).map(Target::Touch))
+            .collect::<Vec<_>>()
     };
+    let target = |point: Vec2, tolerance: f32, reach: f32| {
+        let grab = grabbables
+            .iter()
+            .filter(|(_, item)| item.translation.distance(transform.translation) < reach)
+            .filter_map(|(entity, item)| {
+                let on_screen = camera.world_to_viewport(camera_transform, item.translation).ok()?;
+                let distance = on_screen.distance(point);
+                (distance < tolerance).then_some((entity, distance))
+            })
+            .collect();
+        closest(grab)
+            .map(Target::Grab)
+            .or_else(|| closest(touch_candidates(point, tolerance, reach, false)).map(Target::Touch))
+    };
+    // Objet en main : la cible qui s'en sert (l'armoire), s'il y en a une sous le viseur ou le doigt.
+    let holding_target =
+        |point: Vec2, tolerance: f32| closest(touch_candidates(point, tolerance, mode.reach(), true));
     // Rien à portée sous le doigt ou le viseur, mais un objet plus loin : on le dit.
     let too_far = |game: &mut Game, point: Vec2, tolerance: f32| {
         if target(point, tolerance, f32::INFINITY).is_some() {
@@ -1030,13 +1168,13 @@ fn handle_pointer(
             game.message_until = now + 1.5;
         }
     };
-    let center = window.size() / 2.0;
+    let center = screen / 2.0;
     let aimed = || target(center, CROSSHAIR_TOLERANCE, mode.reach());
-    crosshair.0 = if hand.held.is_none() && aimed().is_some() {
-        CROSSHAIR_TARGET
-    } else {
-        CROSSHAIR_IDLE
+    let aims_target = match hand.held {
+        None => aimed().is_some(),
+        Some(_) => holding_target(center, CROSSHAIR_TOLERANCE).is_some(),
     };
+    crosshair.0 = if aims_target { CROSSHAIR_TARGET } else { CROSSHAIR_IDLE };
 
     // Après la fin : Bureau propre sur le web attend un toucher pour valider l'étape (le temps de
     // lire le débrief) ; sinon on rejoue.
@@ -1055,7 +1193,20 @@ fn handle_pointer(
         match hand.held {
             None if mouse.just_pressed(MouseButton::Left) && game.finished_at.is_none() => {
                 match aimed() {
-                    Some(target) => target.act(&mut hand, &mut bodies, &mut taps, false),
+                    Some(target) => {
+                        let opened = target.use_at(
+                            center, screen, false, &mut hand, &mut bodies, &mut taps, &mut menu, &menus,
+                        );
+                        if opened {
+                            // Le menu se choisit au curseur : on le rend, près de la première ligne.
+                            cursor.grab_mode = CursorGrabMode::None;
+                            cursor.visible = true;
+                            if NATIVE && let Some(open) = &menu.open {
+                                let first = open.row_rect(0).center();
+                                window.set_cursor_position(Some(first));
+                            }
+                        }
+                    }
                     None => too_far(&mut game, center, CROSSHAIR_TOLERANCE),
                 }
             }
@@ -1065,7 +1216,10 @@ fn handle_pointer(
                 if mouse.just_pressed(MouseButton::Right) {
                     drop_held(&mut hand, &mut bodies);
                 } else if mouse.just_pressed(MouseButton::Left) {
-                    hand.charge_start = Some(now);
+                    match holding_target(center, CROSSHAIR_TOLERANCE) {
+                        Some(usable) => taps.0.push(usable),
+                        None => hand.charge_start = Some(now),
+                    }
                 } else if mouse.just_released(MouseButton::Left) {
                     throw_held(&mut hand, &mut bodies, transform, now);
                 }
@@ -1123,21 +1277,108 @@ fn handle_pointer(
     }
     if pointer.released {
         if !gesture.dragging {
+            let scale = pointer_scale(&window);
+            let (point, tolerance) = (gesture.last * scale, TOUCH_TOLERANCE * scale.x);
             if game.finished_at.is_some() {
                 after_finish(&mut game);
             } else if hand.held.is_some() {
-                throw_held(&mut hand, &mut bodies, transform, now);
+                match holding_target(point, tolerance) {
+                    Some(usable) => {
+                        hand.charge_start = None;
+                        taps.0.push(usable);
+                    }
+                    None => throw_held(&mut hand, &mut bodies, transform, now),
+                }
             } else {
-                let scale = pointer_scale(&window);
-                let (point, tolerance) = (gesture.last * scale, TOUCH_TOLERANCE * scale.x);
                 match target(point, tolerance, mode.reach()) {
-                    Some(target) => target.act(&mut hand, &mut bodies, &mut taps, true),
+                    Some(target) => {
+                        target.use_at(point, screen, true, &mut hand, &mut bodies, &mut taps, &mut menu, &menus);
+                    }
                     None => too_far(&mut game, point, tolerance),
                 }
             }
         }
         gesture.start = None;
         gesture.touch = None;
+    }
+}
+
+const MENU_ROW_IDLE: Color = Color::srgba(1.0, 1.0, 1.0, 0.08);
+const MENU_ROW_HOVER: Color = Color::srgba(1.0, 0.8, 0.1, 0.35);
+
+/// Construit le menu quand il s'ouvre ou se ferme, puis éclaire la ligne sous le curseur.
+fn sync_menu_ui(
+    mut commands: Commands,
+    menu: Res<ContextMenu>,
+    window: Single<&Window>,
+    roots: Query<Entity, With<MenuRoot>>,
+    mut rows: Query<(&MenuRow, &mut BackgroundColor)>,
+) {
+    if menu.is_changed() {
+        roots.iter().for_each(|root| commands.entity(root).despawn());
+        let Some(open) = &menu.open else { return };
+        commands
+            .spawn((
+                MenuRoot,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(open.origin.x),
+                    top: Val::Px(open.origin.y),
+                    width: Val::Px(MENU_WIDTH),
+                    padding: UiRect::all(Val::Px(MENU_PAD)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(MENU_GAP),
+                    border_radius: BorderRadius::all(Val::Px(12.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.07, 0.09, 0.13, 0.95)),
+                GlobalZIndex(10),
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Node {
+                        height: Val::Px(MENU_TITLE),
+                        align_items: AlignItems::Center,
+                        padding: UiRect::horizontal(Val::Px(8.0)),
+                        ..default()
+                    },
+                    children![(
+                        Text::new(open.title),
+                        TextFont {
+                            font_size: FontSize::Px(14.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgba(1.0, 1.0, 1.0, 0.6)),
+                    )],
+                ));
+                for (index, label) in open.labels.iter().enumerate() {
+                    panel.spawn((
+                        MenuRow(index),
+                        Node {
+                            height: Val::Px(MENU_ROW),
+                            align_items: AlignItems::Center,
+                            padding: UiRect::horizontal(Val::Px(10.0)),
+                            border_radius: BorderRadius::all(Val::Px(8.0)),
+                            ..default()
+                        },
+                        BackgroundColor(MENU_ROW_IDLE),
+                        children![(
+                            Text::new(format!("{}   {label}", index + 1)),
+                            TextFont {
+                                font_size: FontSize::Px(15.0),
+                                ..default()
+                            },
+                        )],
+                    ));
+                }
+            });
+        return;
+    }
+    let Some(open) = &menu.open else { return };
+    let cursor = window.cursor_position();
+    for (row, mut background) in &mut rows {
+        let hovered = cursor.is_some_and(|point| open.row_rect(row.0).contains(point));
+        background.0 = if hovered { MENU_ROW_HOVER } else { MENU_ROW_IDLE };
     }
 }
 
@@ -1247,6 +1488,7 @@ fn restart(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut hand: ResMut<Hand>,
     mut taps: ResMut<Taps>,
+    mut menu: ResMut<ContextMenu>,
     mut game: ResMut<Game>,
 ) {
     if !keys.just_pressed(KeyCode::KeyR) && !game.restart_requested {
@@ -1257,6 +1499,7 @@ fn restart(
     }
     *hand = Hand::default();
     taps.0.clear();
+    *menu = ContextMenu::default();
     let now = time.elapsed_secs();
     match *mode {
         GameMode::Trash => spawn_trash(&mut commands, &mut meshes, &mut materials, &mut game, now),
@@ -1412,13 +1655,13 @@ fn setup_ui(mut commands: Commands, mode: Res<GameMode>) {
                         "Touchez un déchet : l'attraper | Glissez : viser\nAppui long puis relâcher : lancer\nPouce glissé à gauche : avancer"
                     }
                     (GameMode::CleanDesk, true, _) => {
-                        "ZQSD : marcher | Clic sur un objet proche : le prendre ou agir | Maintenir puis relâcher : lancer dans un bac | R : rejouer | Échap : souris"
+                        "ZQSD : marcher | Clic sur un objet proche : que faire ? | En main : le lancer dans la broyeuse, ou clic sur l'armoire | R : rejouer | Échap : souris"
                     }
                     (GameMode::CleanDesk, false, true) => {
-                        "Cliquez dans le jeu pour regarder à la souris (Échap pour la libérer)\nZQSD : marcher | Clic sur un objet proche : le prendre | Maintenir puis relâcher : lancer"
+                        "Cliquez dans le jeu pour regarder à la souris (Échap pour la libérer)\nZQSD : marcher | Clic sur un objet proche : que faire ? | En main : broyeuse (lancer) ou armoire (clic)"
                     }
                     (GameMode::CleanDesk, false, false) => {
-                        "Pouce à gauche : marcher | À droite : regarder\nTouchez un objet proche : le prendre\nAppui long puis relâcher : lancer dans un bac"
+                        "Pouce à gauche : marcher | À droite : regarder\nTouchez un objet proche : que faire ?\nEn main : lancer dans la broyeuse ou toucher l'armoire"
                     }
                 }),
                 TextFont {
