@@ -1,6 +1,7 @@
 #[cfg(feature = "autoplay")]
 mod autoplay;
 mod clean_desk;
+mod inbox;
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
@@ -54,11 +55,12 @@ struct Player {
 }
 
 /// « Trash Toss » par défaut ; « Bureau propre » avec `cargo dev -- bureau-propre`
-/// ou `?jeu=bureau-propre` dans l'adresse de la page web.
+/// ou `?jeu=bureau-propre` dans l'adresse de la page web ; « Boîte mail piégée » avec `boite-mail`.
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
 enum GameMode {
     Trash,
     CleanDesk,
+    Inbox,
 }
 
 impl GameMode {
@@ -67,24 +69,40 @@ impl GameMode {
         let wanted = web::game_param();
         #[cfg(not(target_arch = "wasm32"))]
         let wanted = std::env::args().nth(1).unwrap_or_default();
-        if wanted == "bureau-propre" { Self::CleanDesk } else { Self::Trash }
+        match wanted.as_str() {
+            "bureau-propre" => Self::CleanDesk,
+            "boite-mail" => Self::Inbox,
+            _ => Self::Trash,
+        }
     }
 
     fn activity_key(self) -> &'static str {
         match self {
             Self::Trash => "trash-toss",
             Self::CleanDesk => "bureau-propre",
+            Self::Inbox => "boite-mail",
         }
     }
 
     /// Trash Toss : le déchet visé vole jusqu'à la main. Bureau propre : on va jusqu'à l'objet.
+    /// Boîte mail : assis, tout est à portée de bras.
     fn reach(self) -> f32 {
         match self {
             Self::Trash => 8.0,
             Self::CleanDesk => 2.5,
+            Self::Inbox => 2.0,
         }
     }
+
+    /// Assis à son poste : on tourne la tête, on ne marche pas (pas de joystick).
+    fn seated(self) -> bool {
+        self == Self::Inbox
+    }
 }
+
+/// Interface plein écran ouverte (la messagerie) : elle prend le pointeur, le jeu 3D l'ignore.
+#[derive(Resource, Default)]
+struct PointerCaptured(bool);
 
 /// Meuble qu'on ne traverse pas : le joueur n'a pas de corps physique, on le repousse.
 #[derive(Component)]
@@ -346,6 +364,7 @@ fn main() {
     let mode = GameMode::detect();
     let trash = |mode: Res<GameMode>| *mode == GameMode::Trash;
     let clean_desk = |mode: Res<GameMode>| *mode == GameMode::CleanDesk;
+    let inbox = |mode: Res<GameMode>| *mode == GameMode::Inbox;
 
     let mut app = App::new();
     app.add_plugins((
@@ -354,6 +373,7 @@ fn main() {
                     title: match mode {
                         GameMode::Trash => "Trash Toss",
                         GameMode::CleanDesk => "Bureau propre",
+                        GameMode::Inbox => "Boîte mail piégée",
                     }
                     .into(),
                     canvas: Some("#bevy".into()),
@@ -376,6 +396,9 @@ fn main() {
         .init_resource::<MouseLook>()
         .init_resource::<ContextMenu>()
         .init_resource::<Taps>()
+        .init_resource::<PointerCaptured>()
+        .init_resource::<inbox::Inbox>()
+        .init_resource::<inbox::Zoom>()
         .add_systems(
             Startup,
             (
@@ -386,6 +409,7 @@ fn main() {
                 lock_cursor,
                 (setup_bin, setup_trash).run_if(trash),
                 clean_desk::setup.after(setup_ui).run_if(clean_desk),
+                inbox::setup.after(setup_ui).run_if(inbox),
             ),
         )
         .add_systems(
@@ -403,11 +427,32 @@ fn main() {
                     clean_desk::animate_doors,
                 )
                     .run_if(clean_desk),
+                (
+                    inbox::use_taps,
+                    inbox::screen_input,
+                    inbox::run_commands,
+                    inbox::resolve_menu,
+                    inbox::arrivals,
+                    inbox::infection,
+                    inbox::animate_printing,
+                    inbox::zoom_camera,
+                )
+                    .chain()
+                    .run_if(inbox),
                 notify_geogaming,
                 update_joystick_ui,
                 sync_menu_ui,
                 update_ui.run_if(trash),
                 (clean_desk::update_ui, clean_desk::place_labels).run_if(clean_desk),
+                (
+                    inbox::sync_screen_ui,
+                    inbox::update_screen,
+                    inbox::update_hud,
+                    inbox::update_monitor,
+                    clean_desk::place_labels,
+                )
+                    .chain()
+                    .run_if(inbox),
                 toggle_cursor,
                 restart,
             )
@@ -416,7 +461,11 @@ fn main() {
     #[cfg(feature = "autoplay")]
     app.add_systems(
         Update,
-        (autoplay::autoplay.run_if(trash), autoplay::autoplay_clean_desk.run_if(clean_desk)),
+        (
+            autoplay::autoplay.run_if(trash),
+            autoplay::autoplay_clean_desk.run_if(clean_desk),
+            autoplay::autoplay_inbox.run_if(inbox),
+        ),
     );
     app.run();
 }
@@ -543,7 +592,7 @@ fn setup_office(
             emissive: LinearRgba::rgb(0.5, 1.0, 2.0),
             ..default()
         },
-        GameMode::CleanDesk => StandardMaterial {
+        GameMode::CleanDesk | GameMode::Inbox => StandardMaterial {
             base_color: Color::srgb(0.02, 0.02, 0.03),
             perceptual_roughness: 0.15,
             ..default()
@@ -794,12 +843,15 @@ fn spawn_trash(
 // ---------- Joueur ----------
 
 fn setup_player(mut commands: Commands, mode: Res<GameMode>) {
+    // Trash Toss : les déchets au sol ; Bureau propre : les bacs et la pièce ; Boîte mail : assis
+    // face à son écran.
+    let (yaw, pitch, eye) = match *mode {
+        GameMode::Trash => (0.0, -0.3, Vec3::new(0.0, EYE_HEIGHT, 6.5)),
+        GameMode::CleanDesk => (0.0, -0.15, Vec3::new(0.0, EYE_HEIGHT, 6.5)),
+        GameMode::Inbox => (inbox::SEAT_YAW, inbox::SEAT_PITCH, inbox::seat_eye()),
+    };
     commands.spawn((
-        Player {
-            yaw: 0.0,
-            // Trash Toss : les déchets au sol ; Bureau propre : les bacs et la pièce.
-            pitch: if *mode == GameMode::Trash { -0.3 } else { -0.15 },
-        },
+        Player { yaw, pitch },
         Camera3d::default(),
         Projection::from(PerspectiveProjection {
             fov: 65f32.to_radians(),
@@ -807,7 +859,7 @@ fn setup_player(mut commands: Commands, mode: Res<GameMode>) {
         }),
         // Écrans de téléphone très denses : l'anticrénelage y coûte plus qu'il ne rapporte.
         if NATIVE { Msaa::Sample4 } else { Msaa::Off },
-        Transform::from_xyz(0.0, EYE_HEIGHT, 6.5),
+        Transform::from_translation(eye),
     ));
 }
 
@@ -857,8 +909,10 @@ fn toggle_cursor(
     touches: Res<Touches>,
     mut cursor: Single<&mut CursorOptions>,
     mut mouse_look: ResMut<MouseLook>,
+    captured: Res<PointerCaptured>,
 ) {
-    let clicked = mouse.just_pressed(MouseButton::Left);
+    // Messagerie ouverte : la souris reste libre, un clic y choisit un bouton.
+    let clicked = mouse.just_pressed(MouseButton::Left) && !captured.0;
     if NATIVE {
         if keys.just_pressed(KeyCode::Escape) {
             cursor.grab_mode = CursorGrabMode::None;
@@ -908,6 +962,16 @@ fn look_and_walk(
         player.yaw -= mouse_motion.delta.x * MOUSE_SENSITIVITY;
         player.pitch = (player.pitch - mouse_motion.delta.y * MOUSE_SENSITIVITY).clamp(-1.5, 1.5);
     }
+    // Assis : on tourne la tête jusqu'à l'imprimante et la broyeuse, on baisse les yeux vers la
+    // corbeille, et on reste sur sa chaise.
+    if mode.seated() {
+        let (yaw, turn) = (inbox::SEAT_YAW, inbox::SEAT_TURN);
+        player.yaw = player.yaw.clamp(yaw - turn, yaw + turn);
+        player.pitch = player.pitch.clamp(-1.2, 0.8);
+        transform.rotation = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0);
+        transform.translation = inbox::seat_eye();
+        return;
+    }
     transform.rotation = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0);
 
     let forward = Vec3::new(-player.yaw.sin(), 0.0, -player.yaw.cos());
@@ -934,7 +998,7 @@ fn look_and_walk(
     // jaune dans Trash Toss.
     let front = match *mode {
         GameMode::Trash => THROW_LINE_Z + 0.05,
-        GameMode::CleanDesk => -ROOM_HALF_Z + 0.4,
+        GameMode::CleanDesk | GameMode::Inbox => -ROOM_HALF_Z + 0.4,
     };
     let p = &mut transform.translation;
     p.x = p.x.clamp(-ROOM_HALF_X + 1.1, ROOM_HALF_X - 1.1);
@@ -1096,12 +1160,18 @@ fn handle_pointer(
     mut bodies: Bodies,
     mut hand: ResMut<Hand>,
     (mut gesture, mut joystick, mouse_look): (ResMut<Gesture>, ResMut<Joystick>, Res<MouseLook>),
-    (mut game, mut taps, mut menu): (ResMut<Game>, ResMut<Taps>, ResMut<ContextMenu>),
+    (mut game, mut taps, mut menu, captured): (ResMut<Game>, ResMut<Taps>, ResMut<ContextMenu>, Res<PointerCaptured>),
     mut crosshair: Single<&mut BackgroundColor, With<Crosshair>>,
 ) {
     let (mut player, transform, camera, camera_transform) = camera.into_inner();
     let now = time.elapsed_secs();
     let screen = window.size();
+
+    // Messagerie ouverte : elle lit elle-même clics et touchers.
+    if captured.0 {
+        *gesture = Gesture::default();
+        return;
+    }
 
     // Menu ouvert : il prend tout. Un choix (clic, toucher, touches 1 à 4) ou un clic à côté le ferme.
     if let Some(open) = &menu.open {
@@ -1179,7 +1249,7 @@ fn handle_pointer(
     // Après la fin : Bureau propre sur le web attend un toucher pour valider l'étape (le temps de
     // lire le débrief) ; sinon on rejoue.
     let after_finish = |game: &mut Game| {
-        if *mode == GameMode::CleanDesk && !NATIVE {
+        if *mode != GameMode::Trash && !NATIVE {
             game.continue_requested = true;
         } else {
             game.restart_requested = true;
@@ -1243,7 +1313,7 @@ fn handle_pointer(
         let css_width = window.width() / pointer_scale(&window).x;
         *gesture = Gesture {
             touch,
-            left_zone: touch.is_some() && position.x < css_width * JOYSTICK_ZONE,
+            left_zone: touch.is_some() && position.x < css_width * JOYSTICK_ZONE && !mode.seated(),
             start: Some(position),
             last: position,
             dragging: false,
@@ -1466,7 +1536,7 @@ fn notify_geogaming(time: Res<Time>, mode: Res<GameMode>, mut game: ResMut<Game>
     let Some(end) = game.finished_at else { return };
     let ready = match *mode {
         GameMode::Trash => time.elapsed_secs() >= end + 2.0,
-        GameMode::CleanDesk => game.continue_requested,
+        GameMode::CleanDesk | GameMode::Inbox => game.continue_requested,
     };
     if game.notified || !ready {
         return;
@@ -1490,6 +1560,7 @@ fn restart(
     mut taps: ResMut<Taps>,
     mut menu: ResMut<ContextMenu>,
     mut game: ResMut<Game>,
+    mut captured: ResMut<PointerCaptured>,
 ) {
     if !keys.just_pressed(KeyCode::KeyR) && !game.restart_requested {
         return;
@@ -1500,10 +1571,12 @@ fn restart(
     *hand = Hand::default();
     taps.0.clear();
     *menu = ContextMenu::default();
+    captured.0 = false;
     let now = time.elapsed_secs();
     match *mode {
         GameMode::Trash => spawn_trash(&mut commands, &mut meshes, &mut materials, &mut game, now),
         GameMode::CleanDesk => clean_desk::spawn_round(&mut commands, &mut meshes, &mut materials, &mut game, now),
+        GameMode::Inbox => inbox::spawn_round(&mut commands, &mut meshes, &mut materials, &mut game, now),
     }
 }
 
@@ -1662,6 +1735,15 @@ fn setup_ui(mut commands: Commands, mode: Res<GameMode>) {
                     }
                     (GameMode::CleanDesk, false, false) => {
                         "Pouce à gauche : marcher | À droite : regarder\nTouchez un objet proche : que faire ?\nEn main : lancer dans la broyeuse ou toucher l'armoire"
+                    }
+                    (GameMode::Inbox, true, _) => {
+                        "Souris : regarder autour de vous | Clic sur l'écran : lire vos mails | R : rejouer | Échap : souris"
+                    }
+                    (GameMode::Inbox, false, true) => {
+                        "Cliquez dans le jeu pour regarder à la souris (Échap pour la libérer)\nClic sur l'écran de l'ordinateur : lire vos mails"
+                    }
+                    (GameMode::Inbox, false, false) => {
+                        "Glissez pour regarder autour de vous\nTouchez l'écran de l'ordinateur pour lire vos mails"
                     }
                 }),
                 TextFont {

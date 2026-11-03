@@ -293,38 +293,44 @@ pub(crate) fn setup(
         ("Broyeuse", shredder + Vec3::Y * 1.0),
         ("Armoire fermée à clé", ARMOIRE + Vec3::Y * 2.25),
     ] {
-        commands
-            .spawn((
-                WorldLabel(anchor),
-                Node {
-                    position_type: PositionType::Absolute,
-                    width: Val::Px(LABEL_WIDTH),
-                    justify_content: JustifyContent::Center,
-                    ..default()
-                },
-                Visibility::Hidden,
-            ))
-            .with_children(|label| {
-                label.spawn((
-                    Node {
-                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
-                        border_radius: BorderRadius::all(Val::Px(10.0)),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
-                    children![(
-                        Text::new(text),
-                        TextFont {
-                            font_size: FontSize::Px(14.0),
-                            ..default()
-                        },
-                    )],
-                ));
-            });
+        spawn_label(&mut commands, text, anchor);
     }
 
     spawn_ui(&mut commands);
     spawn_round(&mut commands, &mut meshes, &mut materials, &mut game, time.elapsed_secs());
+}
+
+/// Étiquette sombre au-dessus d'un meuble, placée chaque image par `place_labels`.
+pub(crate) fn spawn_label(commands: &mut Commands, text: &str, anchor: Vec3) -> Entity {
+    commands
+        .spawn((
+            WorldLabel(anchor),
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Px(LABEL_WIDTH),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            Visibility::Hidden,
+        ))
+        .with_children(|label| {
+            label.spawn((
+                Node {
+                    padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                    border_radius: BorderRadius::all(Val::Px(10.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
+                children![(
+                    Text::new(text),
+                    TextFont {
+                        font_size: FontSize::Px(14.0),
+                        ..default()
+                    },
+                )],
+            ));
+        })
+        .id()
 }
 
 fn spawn_ui(commands: &mut Commands) {

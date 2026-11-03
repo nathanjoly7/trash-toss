@@ -3,12 +3,15 @@
 //! - Trash Toss : ramasse le déchet le plus proche et le lance en cloche vers la poubelle.
 //! - Bureau propre : passe par les vrais choix du menu et la vraie armoire, avec deux erreurs
 //!   volontaires (brancher la clé USB, ranger le post-it dans l'armoire) : 5 / 5, 1400 points.
+//! - Boîte mail : ouvre la messagerie et chaque mail, avec deux erreurs volontaires (la facture
+//!   piégée, puis débrancher le câble ; le faux partage Microsoft) : 8 / 8, 1400 points.
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
 use crate::{
     BIN_POS, ContextMenu, Hand, MenuChoices, Player, Taps, Trash,
     clean_desk::{Armoire, Destination, Outcome, Receptacle, Risk},
+    inbox::{Action, Inbox, ScreenCommand, Tower},
 };
 
 const GRAVITY: f32 = 9.81;
@@ -136,6 +139,70 @@ pub fn autoplay_clean_desk(
                 gravity.0 = 1.0;
                 *hand = Hand::default();
             }
+        }
+    }
+    *step += 1;
+    *next_action = now + pause;
+}
+
+/// Une étape de la boîte mail : (pause avant l'étape suivante, action). Un mail pas encore arrivé
+/// fait attendre l'étape.
+enum MailStep {
+    Screen(ScreenCommand),
+    Unplug,
+}
+
+const MAIL_SCRIPT: [(f32, MailStep); 21] = [
+    (1.0, MailStep::Screen(ScreenCommand::Focus)),
+    (0.8, MailStep::Screen(ScreenCommand::Open(0))),
+    (1.2, MailStep::Screen(ScreenCommand::Act(0, Action::Attachment))),
+    (0.8, MailStep::Screen(ScreenCommand::Open(1))),
+    (1.2, MailStep::Screen(ScreenCommand::Act(1, Action::Report))),
+    (0.8, MailStep::Screen(ScreenCommand::Open(2))),
+    (1.2, MailStep::Screen(ScreenCommand::Act(2, Action::Archive))),
+    (0.8, MailStep::Screen(ScreenCommand::Open(3))),
+    (1.5, MailStep::Screen(ScreenCommand::Act(3, Action::Attachment))),
+    (1.0, MailStep::Screen(ScreenCommand::Close)),
+    (4.5, MailStep::Unplug),
+    (1.0, MailStep::Screen(ScreenCommand::Focus)),
+    (0.8, MailStep::Screen(ScreenCommand::Open(4))),
+    (1.2, MailStep::Screen(ScreenCommand::Act(4, Action::Link))),
+    (1.2, MailStep::Screen(ScreenCommand::Act(4, Action::Report))),
+    (0.8, MailStep::Screen(ScreenCommand::Open(5))),
+    (1.2, MailStep::Screen(ScreenCommand::Act(5, Action::Link))),
+    (0.8, MailStep::Screen(ScreenCommand::Open(6))),
+    (1.2, MailStep::Screen(ScreenCommand::Act(6, Action::Report))),
+    (0.8, MailStep::Screen(ScreenCommand::Open(7))),
+    (1.2, MailStep::Screen(ScreenCommand::Act(7, Action::Delete))),
+];
+
+pub fn autoplay_inbox(
+    time: Res<Time>,
+    mut state: Local<(f32, usize)>,
+    mut inbox: ResMut<Inbox>,
+    mut menu: ResMut<ContextMenu>,
+    towers: Query<Entity, (With<Tower>, With<MenuChoices>)>,
+) {
+    let (next_action, step) = &mut *state;
+    let now = time.elapsed_secs();
+    if now < 2.0 || now < *next_action {
+        return;
+    }
+    let Some((pause, action)) = MAIL_SCRIPT.get(*step) else { return };
+    match action {
+        MailStep::Screen(command) => {
+            let mail = match command {
+                ScreenCommand::Open(mail) | ScreenCommand::Act(mail, _) => Some(*mail),
+                _ => None,
+            };
+            if mail.is_some_and(|mail| !inbox.has_arrived(mail)) {
+                return;
+            }
+            inbox.queue.push(*command);
+        }
+        MailStep::Unplug => {
+            let Some(tower) = towers.iter().next() else { return };
+            menu.chosen = Some((tower, 1));
         }
     }
     *step += 1;
